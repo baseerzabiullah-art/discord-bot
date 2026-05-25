@@ -1304,68 +1304,6 @@ async def serverinfo_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-# ── .lock / .unlock ───────────────────────────────────────────────────────────
-@bot.command(name="lock")
-@commands.has_permissions(manage_channels=True)
-async def lock_prefix(ctx, channel: discord.TextChannel = None):
-    channel = channel or ctx.channel
-    await channel.set_permissions(ctx.guild.default_role, send_messages=False)
-    await ctx.send(embed=success_embed("🔒  Channel Locked", f"{channel.mention} is now locked."))
-
-@tree.command(name="lock", description="Lock a channel")
-@app_commands.describe(channel="Channel to lock (defaults to current)")
-@app_commands.default_permissions(manage_channels=True)
-async def lock_slash(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    channel = channel or interaction.channel
-    await channel.set_permissions(interaction.guild.default_role, send_messages=False)
-    await interaction.response.send_message(
-        embed=success_embed("🔒  Channel Locked", f"{channel.mention} is now locked."), ephemeral=True
-    )
-
-@bot.command(name="unlock")
-@commands.has_permissions(manage_channels=True)
-async def unlock_prefix(ctx, channel: discord.TextChannel = None):
-    channel = channel or ctx.channel
-    await channel.set_permissions(ctx.guild.default_role, send_messages=None)
-    await ctx.send(embed=success_embed("🔓  Channel Unlocked", f"{channel.mention} is now unlocked."))
-
-@tree.command(name="unlock", description="Unlock a channel")
-@app_commands.describe(channel="Channel to unlock (defaults to current)")
-@app_commands.default_permissions(manage_channels=True)
-async def unlock_slash(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    channel = channel or interaction.channel
-    await channel.set_permissions(interaction.guild.default_role, send_messages=None)
-    await interaction.response.send_message(
-        embed=success_embed("🔓  Channel Unlocked", f"{channel.mention} is now unlocked."), ephemeral=True
-    )
-
-# ── .lockdown ─────────────────────────────────────────────────────────────────
-@bot.command(name="lockdown")
-@commands.has_permissions(administrator=True)
-async def lockdown_prefix(ctx):
-    await ctx.send(embed=discord.Embed(description="⏳  Locking down all channels...", color=0xFEE75C))
-    locked = 0
-    for channel in ctx.guild.text_channels:
-        try:
-            await channel.set_permissions(ctx.guild.default_role, send_messages=False)
-            locked += 1
-        except discord.Forbidden:
-            pass
-    await ctx.send(embed=success_embed("🔒  Server Lockdown", f"Locked {locked} channels."))
-
-@tree.command(name="lockdown", description="Lock all channels in the server")
-@app_commands.default_permissions(administrator=True)
-async def lockdown_slash(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    locked = 0
-    for channel in interaction.guild.text_channels:
-        try:
-            await channel.set_permissions(interaction.guild.default_role, send_messages=False)
-            locked += 1
-        except discord.Forbidden:
-            pass
-    await interaction.followup.send(embed=success_embed("🔒  Server Lockdown", f"Locked {locked} channels."), ephemeral=True)
-
 # ── .nuke ─────────────────────────────────────────────────────────────────────
 @bot.command(name="nuke")
 @commands.has_permissions(manage_channels=True)
@@ -1572,70 +1510,6 @@ async def on_message(message):
             pass
     await bot.process_commands(message)
 
-
-
-# ── .lock / .unlock ───────────────────────────────────────────────────────────
-@bot.command(name="lock")
-@commands.has_permissions(manage_channels=True)
-async def lock_prefix(ctx, channel: discord.TextChannel = None):
-    channel = channel or ctx.channel
-    await channel.set_permissions(ctx.guild.default_role, send_messages=False)
-    await ctx.send(embed=success_embed("🔒  Channel Locked", f"{channel.mention} is now locked."))
-
-@tree.command(name="lock", description="Lock a channel so only mods can talk")
-@app_commands.describe(channel="Channel to lock (default: current channel)")
-@app_commands.default_permissions(manage_channels=True)
-async def lock_slash(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    channel = channel or interaction.channel
-    await channel.set_permissions(interaction.guild.default_role, send_messages=False)
-    await interaction.response.send_message(
-        embed=success_embed("🔒  Channel Locked", f"{channel.mention} is now locked."),
-        ephemeral=True
-    )
-
-@bot.command(name="unlock")
-@commands.has_permissions(manage_channels=True)
-async def unlock_prefix(ctx, channel: discord.TextChannel = None):
-    channel = channel or ctx.channel
-    await channel.set_permissions(ctx.guild.default_role, send_messages=None)
-    await ctx.send(embed=success_embed("🔓  Channel Unlocked", f"{channel.mention} is now unlocked."))
-
-@tree.command(name="unlock", description="Unlock a previously locked channel")
-@app_commands.describe(channel="Channel to unlock (default: current channel)")
-@app_commands.default_permissions(manage_channels=True)
-async def unlock_slash(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    channel = channel or interaction.channel
-    await channel.set_permissions(interaction.guild.default_role, send_messages=None)
-    await interaction.response.send_message(
-        embed=success_embed("🔓  Channel Unlocked", f"{channel.mention} is now unlocked."),
-        ephemeral=True
-    )
-
-# ── .lockdown ─────────────────────────────────────────────────────────────────
-@bot.command(name="lockdown")
-@commands.has_permissions(administrator=True)
-async def lockdown_prefix(ctx):
-    await ctx.send(embed=discord.Embed(description="🔒 Locking down all channels...", color=0xFEE75C))
-    for channel in ctx.guild.text_channels:
-        try:
-            await channel.set_permissions(ctx.guild.default_role, send_messages=False)
-        except:
-            pass
-    await ctx.send(embed=success_embed("🔒  Server Locked Down", "All channels have been locked."))
-
-@tree.command(name="lockdown", description="Lock down all channels in the server")
-@app_commands.default_permissions(administrator=True)
-async def lockdown_slash(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        embed=discord.Embed(description="🔒 Locking down all channels...", color=0xFEE75C),
-        ephemeral=True
-    )
-    for channel in interaction.guild.text_channels:
-        try:
-            await channel.set_permissions(interaction.guild.default_role, send_messages=False)
-        except:
-            pass
-    await interaction.followup.send(embed=success_embed("🔒  Server Locked Down", "All channels locked."), ephemeral=True)
 
 # ── .nuke ─────────────────────────────────────────────────────────────────────
 @bot.command(name="nuke")
