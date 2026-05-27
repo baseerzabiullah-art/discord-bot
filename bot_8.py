@@ -460,7 +460,7 @@ async def ban_prefix(ctx, user: discord.Member, *, reason: str = "No reason prov
     ban_log.setdefault(user.id, []).append({"reason": reason, "by": str(ctx.author), "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")})
     await user.ban(reason=f"{ctx.author}: {reason}")
     add_mod_log(user.id, "ban", reason, str(ctx.author))
-    await ctx.send(embed=discord.Embed(title="🔨  User Banned",
+    embed = discord.Embed(title="🔨  User Banned",
         description=f"**{user}** banned.\n**Reason:** {reason}\n**By:** {ctx.author.mention}", color=0xED4245))
     await ctx.message.delete()
 
@@ -485,8 +485,10 @@ async def warn_prefix(ctx, user: discord.Member, *, reason: str = "No reason pro
         "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
     })
     count = len(warnings[user.id])
-    await ctx.send(embed=discord.Embed(title="⚠️  User Warned", color=0xFEE75C,
-        description=f"**User:** {user.mention}\n**Reason:** {reason}\n**By:** {ctx.author.mention}\n**Total warnings:** {count}"))
+    embed = discord.Embed(title="⚠️  User Warned", color=0xFEE75C,
+        description=f"**User:** {user.mention}\n**Reason:** {reason}\n**By:** {ctx.author.mention}\n**Total warnings:** {count}")
+    await send_to_logs(ctx.guild, embed)
+    await ctx.send(embed=embed)
     await ctx.message.delete()
     try:
         await user.send(embed=discord.Embed(title="⚠️  Warning Received",
@@ -794,7 +796,9 @@ async def nuke_prefix(ctx, channel: discord.TextChannel = None):
     new_channel = await channel.clone(reason=f"Channel nuked by {ctx.author}")
     await new_channel.edit(position=position)
     await channel.delete(reason=f"Channel nuked by {ctx.author}")
-    await new_channel.send(embed=success_embed("💥  Channel Nuked", f"This channel was nuked by {ctx.author.mention}."))
+    embed = success_embed("💥  Channel Nuked", f"This channel was nuked by {ctx.author.mention}.")
+    embed.set_image(url="https://media.giphy.com/media/MDJ9IbxxvDUQM/giphy.gif")
+    await new_channel.send(embed=embed)
 
 @bot.command(name="nickname")
 @commands.has_permissions(manage_nicknames=True)
@@ -916,6 +920,61 @@ async def on_member_join(member):
                 pass
 
 
+# ── .logschannel / /logschannel ───────────────────────────────────────────────
+@bot.command(name="logschannel")
+@commands.has_permissions(administrator=True)
+async def logschannel_prefix(ctx, channel: discord.TextChannel):
+    logs_channels[ctx.guild.id] = channel.id
+    await ctx.send(embed=success_embed("📋  Logs Channel Set", f"Logs will now be sent to {channel.mention}."))
+    await ctx.message.delete()
+
+@tree.command(name="logschannel", description="Set the channel for moderation logs and audit activity")
+@app_commands.describe(channel="Channel to send logs to")
+@app_commands.default_permissions(administrator=True)
+async def logschannel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
+    logs_channels[interaction.guild.id] = channel.id
+    await interaction.response.send_message(
+        embed=success_embed("📋  Logs Channel Set", f"Logs will now be sent to {channel.mention}."),
+        ephemeral=True
+    )
+
+async def send_to_logs(guild: discord.Guild, embed: discord.Embed):
+    """Send an embed to the configured logs channel and ghost ping the owner."""
+    channel_id = logs_channels.get(guild.id)
+    if not channel_id:
+        return
+    
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    
+    try:
+        # Send log with ghost ping (mention that disappears after sending)
+        msg = await channel.send(f"<@{guild.owner_id}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=False))
+        # The ping will show in audit log but won't actually notify the owner
+    except discord.Forbidden:
+        pass
+
+
+# ── .logschannel ──────────────────────────────────────────────────────────────
+@bot.command(name="logschannel")
+@commands.has_permissions(administrator=True)
+async def logschannel_prefix(ctx, channel: discord.TextChannel):
+    logs_channels[ctx.guild.id] = channel.id
+    await ctx.send(embed=success_embed("📋  Logs Channel Set", f"Logs will now be sent to {channel.mention}."))
+    await ctx.message.delete()
+
+@tree.command(name="logschannel", description="Set channel for moderation logs")
+@app_commands.describe(channel="Channel for logs")
+@app_commands.default_permissions(administrator=True)
+async def logschannel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
+    logs_channels[interaction.guild.id] = channel.id
+    await interaction.response.send_message(
+        embed=success_embed("📋  Logs Channel Set", f"Logs will now be sent to {channel.mention}."),
+        ephemeral=True
+    )
+
+
 # ── .reviewpanel / /reviewpanel ───────────────────────────────────────────────
 @bot.command(name="reviewpanel")
 @commands.has_permissions(administrator=True)
@@ -977,8 +1036,9 @@ async def on_ready():
     await tree.sync()
     print("✅  Slash commands synced")
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="Watching over Sparky")
+        activity=discord.Activity(type=discord.ActivityType.watching, name="Watching over Sparky AI")
     )
 
 if __name__ == "__main__":
     bot.run(TOKEN)
+    
