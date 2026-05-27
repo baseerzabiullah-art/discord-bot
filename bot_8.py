@@ -854,7 +854,6 @@ async def avatar_prefix(ctx, user: discord.Member = None):
     embed.set_image(url=user.display_avatar.url)
     await ctx.send(embed=embed)
 
-@bot.event
 @bot.command(name="antiraid")
 @commands.has_permissions(administrator=True)
 async def antiraid_prefix(ctx, status: str):
@@ -869,7 +868,6 @@ async def antiraid_prefix(ctx, status: str):
         await ctx.reply("Usage: `.antiraid on/off`", delete_after=10)
     await ctx.message.delete()
 
-@bot.event
 @bot.event
 async def on_member_join(member):
     # Anti-raid: kick accounts < 7 days old
@@ -894,7 +892,6 @@ async def reviewpanel_prefix(ctx, channel: discord.TextChannel):
     ))
     await ctx.message.delete()
 
-@bot.event
 async def on_command_completion(ctx):
     """Auto-delete command messages after successful execution."""
     try:
@@ -904,7 +901,6 @@ async def on_command_completion(ctx):
         pass
 
 
-@bot.event  
 async def on_mention(message):
     """Respond when bot is mentioned."""
     if message.author.bot or not bot.user.mentioned_in(message):
@@ -922,7 +918,6 @@ async def on_mention(message):
     await message.reply(embed=embed, mention_author=False)
 
 
-@bot.event
 @bot.event
 async def on_member_remove(member):
     """Log member leaves."""
