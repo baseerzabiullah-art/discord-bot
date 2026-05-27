@@ -957,23 +957,6 @@ async def send_to_logs(guild: discord.Guild, embed: discord.Embed):
         pass
 
 
-# ── .logschannel ──────────────────────────────────────────────────────────────
-@bot.command(name="logschannel")
-@commands.has_permissions(administrator=True)
-async def logschannel_prefix(ctx, channel: discord.TextChannel):
-    logs_channels[ctx.guild.id] = channel.id
-    await ctx.send(embed=success_embed("📋  Logs Channel Set", f"Logs will now be sent to {channel.mention}."))
-    await ctx.message.delete()
-
-@tree.command(name="logschannel", description="Set channel for moderation logs")
-@app_commands.describe(channel="Channel for logs")
-@app_commands.default_permissions(administrator=True)
-async def logschannel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
-    logs_channels[interaction.guild.id] = channel.id
-    await interaction.response.send_message(
-        embed=success_embed("📋  Logs Channel Set", f"Logs will now be sent to {channel.mention}."),
-        ephemeral=True
-    )
 
 
 # ── .reviewpanel / /reviewpanel ───────────────────────────────────────────────
