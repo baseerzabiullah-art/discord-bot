@@ -461,7 +461,8 @@ async def ban_prefix(ctx, user: discord.Member, *, reason: str = "No reason prov
     await user.ban(reason=f"{ctx.author}: {reason}")
     add_mod_log(user.id, "ban", reason, str(ctx.author))
     embed = discord.Embed(title="🔨  User Banned",
-        description=f"**{user}** banned.\n**Reason:** {reason}\n**By:** {ctx.author.mention}", color=0xED4245))
+        description=f"**{user}** banned.\n**Reason:** {reason}\n**By:** {ctx.author.mention}", color=0xED4245)
+    await ctx.send(embed=embed)
     await ctx.message.delete()
 
 # ── .unban ────────────────────────────────────────────────────────────────────
@@ -1041,4 +1042,3 @@ async def on_ready():
 
 if __name__ == "__main__":
     bot.run(TOKEN)
-    
