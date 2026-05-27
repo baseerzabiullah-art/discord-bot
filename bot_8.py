@@ -203,18 +203,6 @@ class ChatbanReviewView(discord.ui.View):
 
 
 class AdjustBanModal(discord.ui.Modal, title="Adjust Chat Ban Duration"):
-    def __init__(self, review_view: ChatbanReviewView, action: str):
-        super().__init__()
-        self.review_view = review_view
-        self.action      = action
-
-    new_duration = discord.ui.TextInput(
-        label="New duration",
-        placeholder="e.g. 30m, 6h, 3d",
-        min_length=2,
-        max_length=10,
-    )
-
     async def on_submit(self, interaction: discord.Interaction):
         seconds = parse_duration(self.new_duration.value.strip())
         if not seconds:
@@ -572,212 +560,6 @@ async def modhelp_prefix(ctx):
 # SLASH COMMANDS
 # ════════════════════════════════════════════════════════════════════════════════
 
-@tree.command(name="chatban", description="Remove a user's chat permissions for a duration")
-@app_commands.describe(user="User to chat ban", duration="Duration e.g. 10m, 2h, 1d", reason="Reason for the ban")
-@app_commands.default_permissions(administrator=True)
-async def chatban_slash(interaction: discord.Interaction, user: discord.Member, duration: str, reason: str = "No reason provided"):
-    await interaction.response.defer(ephemeral=True)
-    seconds = parse_duration(duration)
-    if not seconds:
-        await interaction.followup.send(embed=error_embed("Invalid duration. Examples: `30s` `10m` `2h` `1d`"), ephemeral=True); return
-    if user.guild_permissions.administrator:
-        await interaction.followup.send(embed=error_embed("Can't chat-ban an administrator."), ephemeral=True); return
-    embed = await do_chatban(interaction.guild, user, seconds, reason, interaction.user)
-    add_mod_log(user.id, "chatban", reason, str(interaction.user))
-    await interaction.channel.send(embed=embed)
-    await interaction.followup.send(embed=success_embed("✅  Done", f"{user.mention} has been chat banned."), ephemeral=True)
-
-@tree.command(name="unchatban", description="Lift a user's chat ban early")
-@app_commands.describe(user="User to unchat ban")
-@app_commands.default_permissions(administrator=True)
-async def unchatban_slash(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    for channel in interaction.guild.text_channels:
-        try:
-            await channel.set_permissions(user, send_messages=None,
-                                          add_reactions=None,
-                                          create_public_threads=None,
-                                          create_private_threads=None,
-                                          send_messages_in_threads=None, reason=f"Unchatban by {interaction.user}")
-        except discord.Forbidden:
-            pass
-    await interaction.channel.send(embed=success_embed("🔊  Chat Ban Removed", f"{user.mention} can chat again."))
-    await interaction.followup.send(embed=success_embed("✅  Done", "Chat ban lifted."), ephemeral=True)
-
-@tree.command(name="mute", description="Timeout a user for a duration")
-@app_commands.describe(user="User to mute", duration="Duration e.g. 10m, 2h", reason="Reason")
-@app_commands.default_permissions(moderate_members=True)
-async def mute_slash(interaction: discord.Interaction, user: discord.Member, duration: str, reason: str = "No reason provided"):
-    await interaction.response.defer(ephemeral=True)
-    seconds = parse_duration(duration)
-    if not seconds:
-        await interaction.followup.send(embed=error_embed("Invalid duration."), ephemeral=True); return
-    if seconds > 2419200:
-        await interaction.followup.send(embed=error_embed("Max 28 days."), ephemeral=True); return
-    until = discord.utils.utcnow() + timedelta(seconds=seconds)
-    await user.timeout(until, reason=f"{interaction.user}: {reason}")
-    add_mod_log(user.id, "mute", reason, str(interaction.user))
-    expiry_ts = int(until.timestamp())
-    embed = discord.Embed(title="🔕  User Muted", color=0xFEE75C,
-        description=f"**User:** {user.mention}\n**Expires:** <t:{expiry_ts}:R>\n**Reason:** {reason}\n**By:** {interaction.user.mention}")
-    await interaction.channel.send(embed=embed)
-    await interaction.followup.send(embed=success_embed("✅  Done", f"{user.mention} muted."), ephemeral=True)
-
-@tree.command(name="unmute", description="Remove a user's timeout")
-@app_commands.describe(user="User to unmute")
-@app_commands.default_permissions(moderate_members=True)
-async def unmute_slash(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    await user.timeout(None, reason=f"Unmuted by {interaction.user}")
-    await interaction.channel.send(embed=success_embed("🔔  Unmuted", f"{user.mention} unmuted by {interaction.user.mention}."))
-    await interaction.followup.send(embed=success_embed("✅  Done", "User unmuted."), ephemeral=True)
-
-@tree.command(name="kick", description="Kick a user from the server")
-@app_commands.describe(user="User to kick", reason="Reason")
-@app_commands.default_permissions(kick_members=True)
-async def kick_slash(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    await interaction.response.defer(ephemeral=True)
-    if user.guild_permissions.administrator:
-        await interaction.followup.send(embed=error_embed("Can't kick an administrator."), ephemeral=True); return
-    try:
-        await user.send(embed=discord.Embed(title="👢  Kicked",
-            description=f"Kicked from **{interaction.guild.name}**\n**Reason:** {reason}", color=0xED4245))
-    except discord.Forbidden:
-        pass
-    kick_log.setdefault(user.id, []).append({"reason": reason, "by": str(interaction.user), "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")})
-    await user.kick(reason=f"{interaction.user}: {reason}")
-    add_mod_log(user.id, "kick", reason, str(interaction.user))
-    await interaction.channel.send(embed=discord.Embed(title="👢  User Kicked",
-        description=f"**{user}** kicked.\n**Reason:** {reason}\n**By:** {interaction.user.mention}", color=0xED4245))
-    await interaction.followup.send(embed=success_embed("✅  Done", "User kicked."), ephemeral=True)
-
-@tree.command(name="ban", description="Ban a user from the server")
-@app_commands.describe(user="User to ban", reason="Reason")
-@app_commands.default_permissions(ban_members=True)
-async def ban_slash(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    await interaction.response.defer(ephemeral=True)
-    if user.guild_permissions.administrator:
-        await interaction.followup.send(embed=error_embed("Can't ban an administrator."), ephemeral=True); return
-    try:
-        await user.send(embed=discord.Embed(title="🔨  Banned",
-            description=f"Banned from **{interaction.guild.name}**\n**Reason:** {reason}", color=0xED4245))
-    except discord.Forbidden:
-        pass
-    ban_log.setdefault(user.id, []).append({"reason": reason, "by": str(interaction.user), "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")})
-    await user.ban(reason=f"{interaction.user}: {reason}")
-    add_mod_log(user.id, "ban", reason, str(interaction.user))
-    await interaction.channel.send(embed=discord.Embed(title="🔨  User Banned",
-        description=f"**{user}** banned.\n**Reason:** {reason}\n**By:** {interaction.user.mention}", color=0xED4245))
-    await interaction.followup.send(embed=success_embed("✅  Done", "User banned."), ephemeral=True)
-
-@tree.command(name="unban", description="Unban a user by their ID")
-@app_commands.describe(user_id="The user's ID")
-@app_commands.default_permissions(ban_members=True)
-async def unban_slash(interaction: discord.Interaction, user_id: str):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        user = await bot.fetch_user(int(user_id))
-        await interaction.guild.unban(user)
-        await interaction.channel.send(embed=success_embed("✅  Unbanned", f"**{user}** unbanned by {interaction.user.mention}."))
-        await interaction.followup.send(embed=success_embed("✅  Done", "User unbanned."), ephemeral=True)
-    except discord.NotFound:
-        await interaction.followup.send(embed=error_embed("User not found or not banned."), ephemeral=True)
-
-@tree.command(name="warn", description="Warn a user")
-@app_commands.describe(user="User to warn", reason="Reason")
-@app_commands.default_permissions(manage_messages=True)
-async def warn_slash(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    await interaction.response.defer(ephemeral=True)
-    warnings.setdefault(user.id, []).append({
-        "reason": reason, "by": str(interaction.user),
-        "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
-    })
-    count = len(warnings[user.id])
-    await interaction.channel.send(embed=discord.Embed(title="⚠️  User Warned", color=0xFEE75C,
-        description=f"**User:** {user.mention}\n**Reason:** {reason}\n**By:** {interaction.user.mention}\n**Total warnings:** {count}"))
-    await interaction.followup.send(embed=success_embed("✅  Done", f"{user.mention} warned."), ephemeral=True)
-    try:
-        await user.send(embed=discord.Embed(title="⚠️  Warning Received",
-            description=f"Warned in **{interaction.guild.name}**\n**Reason:** {reason}\n**Total warnings:** {count}", color=0xFEE75C))
-    except discord.Forbidden:
-        pass
-    await apply_warning_escalation(interaction.guild, user, count, interaction.channel)
-
-@tree.command(name="warnings", description="View warnings for a user")
-@app_commands.describe(user="User to check")
-@app_commands.default_permissions(manage_messages=True)
-async def warnings_slash(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    user_warnings = warnings.get(user.id, [])
-    if not user_warnings:
-        await interaction.followup.send(embed=success_embed("✅  No Warnings", f"{user.mention} has no warnings."), ephemeral=True); return
-    embed = discord.Embed(title=f"⚠️  Warnings for {user}", description=f"Total: **{len(user_warnings)}**", color=0xFEE75C)
-    for i, w in enumerate(user_warnings, 1):
-        embed.add_field(name=f"#{i}", value=f"**Reason:** {w['reason']}\n**By:** {w['by']}\n**At:** {w['at']}", inline=False)
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-@tree.command(name="clearwarnings", description="Clear all warnings for a user")
-@app_commands.describe(user="User to clear warnings for")
-@app_commands.default_permissions(administrator=True)
-async def clearwarnings_slash(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    warnings.pop(user.id, None)
-    await interaction.followup.send(embed=success_embed("✅  Cleared", f"All warnings cleared for {user.mention}."), ephemeral=True)
-
-@tree.command(name="purge", description="Delete messages in this channel")
-@app_commands.describe(amount="Number of messages to delete (1-100)")
-@app_commands.default_permissions(manage_messages=True)
-async def purge_slash(interaction: discord.Interaction, amount: int):
-    await interaction.response.defer(ephemeral=True)
-    if not 1 <= amount <= 100:
-        await interaction.followup.send(embed=error_embed("Between 1 and 100."), ephemeral=True); return
-    deleted = await interaction.channel.purge(limit=amount)
-    await interaction.followup.send(embed=success_embed("🗑️  Purged", f"Deleted **{len(deleted)}** messages."), ephemeral=True)
-
-@tree.command(name="slowmode", description="Set slowmode for this channel")
-@app_commands.describe(seconds="Seconds (0 to disable, max 21600)")
-@app_commands.default_permissions(manage_channels=True)
-async def slowmode_slash(interaction: discord.Interaction, seconds: int):
-    await interaction.response.defer(ephemeral=True)
-    if not 0 <= seconds <= 21600:
-        await interaction.followup.send(embed=error_embed("Between 0 and 21600."), ephemeral=True); return
-    await interaction.channel.edit(slowmode_delay=seconds)
-    msg = "Slowmode disabled." if seconds == 0 else f"Slowmode set to **{seconds}s**."
-    await interaction.followup.send(embed=success_embed("✅  Slowmode", msg), ephemeral=True)
-
-@tree.command(name="modhelp", description="Show all moderation commands")
-async def modhelp_slash(interaction: discord.Interaction):
-    embed = discord.Embed(title="🛡️  Moderation Commands", color=0x5865F2,
-        description="Use `/command` or `.command` or `?command`. You can **@mention** users or use their ID.")
-    embed.add_field(name="📋  General", value=(
-        "`/usercheck @user` — View full mod history\n"
-        "`/reviewpanel #channel` — Set chatban review channel"
-    ), inline=False)
-    embed.add_field(name="⚠️  Warnings & Bans", value=(
-        "`/warn @user [reason]` — Warn a user\n"
-        "`/warnings @user` — View warnings\n"
-        "`/clearwarnings @user` — Clear all warnings\n"
-        "`/chatban @user [time] [reason]` — Remove chat perms\n"
-        "`/unchatban @user` — Lift chat ban early"
-    ), inline=False)
-    embed.add_field(name="🔨  Kicks & Bans", value=(
-        "`/kick @user [reason]` — Kick a user\n"
-        "`/ban @user [reason]` — Ban a user\n"
-        "`/unban [user_id]` — Unban a user by ID"
-    ), inline=False)
-    embed.add_field(name="🔕  Timeouts & Cleanup", value=(
-        "`/mute @user [time] [reason]` — Timeout a user\n"
-        "`/unmute @user` — Remove timeout\n"
-        "`/purge [amount]` — Delete messages (max 100)\n"
-        "`/slowmode [seconds]` — Set slowmode (0 to disable)"
-    ), inline=False)
-    embed.add_field(name="📊  Auto Escalation", value=(
-        "**3 warnings** → 1 day chat ban\n"
-        "**5 warnings** → 1 week chat ban + final warning\n"
-        "**6 warnings** → 1 month temp ban"
-    ), inline=False)
-    embed.set_footer(text="Duration format: 30s / 10m / 2h / 1d  •  Prefix: . or ?")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ── .check ────────────────────────────────────────────────────────────────────
@@ -791,56 +573,6 @@ chatban_log: dict[int, list[dict]] = {}
 async def usercheck_prefix(ctx, user: discord.Member):
     await _send_check(ctx.channel, user, ctx.guild)
 
-@tree.command(name="usercheck", description="View full moderation history of a user")
-@app_commands.describe(user="User to check")
-@app_commands.default_permissions(manage_messages=True)
-async def usercheck_slash(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    await _send_check(interaction.channel, user, interaction.guild)
-    await interaction.followup.send(embed=success_embed("✅  Done", "Check sent to channel."), ephemeral=True)
-
-async def _send_check(channel, member, guild):
-    now = datetime.now(timezone.utc)
-
-    # ── Account info
-    created_at   = member.created_at
-    joined_at    = member.joined_at
-    account_age  = (now - created_at).days
-    server_age   = (now - joined_at).days if joined_at else "N/A"
-
-    # Flag potentially new accounts
-    age_flag = "🚨 **New account — possible alt!**" if account_age < 30 else ""
-
-    # ── Mod history from logs
-    user_warnings  = warnings.get(member.id, [])
-    user_chatbans  = chatban_log.get(member.id, [])
-    user_kicks     = kick_log.get(member.id, [])
-    user_bans      = ban_log.get(member.id, [])
-
-    # ── Roles
-    roles = [r.mention for r in member.roles if r.name != "@everyone"]
-    roles_str = ", ".join(roles) if roles else "None"
-
-    embed = discord.Embed(
-        title=f"🔍  Moderation Check — {member}",
-        color=0x5865F2,
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-
-    # Account info
-    embed.add_field(
-        name="👤  Account Info",
-        value=(
-            f"**ID:** `{member.id}`\n"
-            f"**Created:** <t:{int(created_at.timestamp())}:D> ({account_age} days ago)\n"
-            f"**Joined:** <t:{int(joined_at.timestamp())}:D> ({server_age} days ago)\n"
-            f"**Roles:** {roles_str}\n"
-            f"{age_flag}"
-        ),
-        inline=False,
-    )
-
-    # Summary
     embed.add_field(
         name="📊  Moderation Summary",
         value=(
@@ -995,18 +727,6 @@ async def lock_prefix(ctx, channel: discord.TextChannel = None):
     await ctx.send(embed=success_embed("🔒  Channel Locked", f"{channel.mention} has been locked."))
     await ctx.message.delete()
 
-@tree.command(name="lock", description="Lock a channel")
-@app_commands.describe(channel="Channel to lock (current channel if not specified)")
-@app_commands.default_permissions(manage_channels=True)
-async def lock_slash(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    channel = channel or interaction.channel
-    await channel.set_permissions(interaction.guild.default_role, send_messages=False,
-                                   reason=f"Channel locked by {interaction.user}")
-    await interaction.response.send_message(
-        embed=success_embed("🔒  Channel Locked", f"{channel.mention} has been locked."),
-        ephemeral=True
-    )
-
 @bot.command(name="unlock")
 @commands.has_permissions(manage_channels=True)
 async def unlock_prefix(ctx, channel: discord.TextChannel = None):
@@ -1016,19 +736,6 @@ async def unlock_prefix(ctx, channel: discord.TextChannel = None):
     await ctx.send(embed=success_embed("🔓  Channel Unlocked", f"{channel.mention} has been unlocked."))
     await ctx.message.delete()
 
-@tree.command(name="unlock", description="Unlock a channel")
-@app_commands.describe(channel="Channel to unlock")
-@app_commands.default_permissions(manage_channels=True)
-async def unlock_slash(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    channel = channel or interaction.channel
-    await channel.set_permissions(interaction.guild.default_role, send_messages=None,
-                                   reason=f"Channel unlocked by {interaction.user}")
-    await interaction.response.send_message(
-        embed=success_embed("🔓  Channel Unlocked", f"{channel.mention} has been unlocked."),
-        ephemeral=True
-    )
-
-# ── .lockdown ─────────────────────────────────────────────────────────────────
 @bot.command(name="lockdown")
 @commands.has_permissions(administrator=True)
 async def lockdown_prefix(ctx):
@@ -1044,22 +751,6 @@ async def lockdown_prefix(ctx):
     await ctx.send(embed=success_embed("🔒  Server Lockdown", f"Locked **{locked}** channels."))
     await ctx.message.delete()
 
-@tree.command(name="lockdown", description="Lock all channels in the server")
-@app_commands.default_permissions(administrator=True)
-async def lockdown_slash(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    locked = 0
-    for channel in interaction.guild.text_channels:
-        try:
-            await channel.set_permissions(interaction.guild.default_role, send_messages=False,
-                                          reason=f"Server lockdown by {interaction.user}")
-            locked += 1
-        except discord.Forbidden:
-            pass
-    await interaction.channel.send(embed=success_embed("🔒  Server Lockdown", f"Locked **{locked}** channels by {interaction.user.mention}."))
-    await interaction.followup.send(embed=success_embed("✅  Done", f"Locked {locked} channels."), ephemeral=True)
-
-# ── .nuke ─────────────────────────────────────────────────────────────────────
 @bot.command(name="nuke")
 @commands.has_permissions(manage_channels=True)
 async def nuke_prefix(ctx, channel: discord.TextChannel = None):
@@ -1070,19 +761,6 @@ async def nuke_prefix(ctx, channel: discord.TextChannel = None):
     await channel.delete(reason=f"Channel nuked by {ctx.author}")
     await new_channel.send(embed=success_embed("💥  Channel Nuked", f"This channel was nuked by {ctx.author.mention}."))
 
-@tree.command(name="nuke", description="Clone and delete a channel (clears all messages)")
-@app_commands.describe(channel="Channel to nuke")
-@app_commands.default_permissions(manage_channels=True)
-async def nuke_slash(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    await interaction.response.defer(ephemeral=True)
-    channel = channel or interaction.channel
-    position = channel.position
-    new_channel = await channel.clone(reason=f"Channel nuked by {interaction.user}")
-    await new_channel.edit(position=position)
-    await channel.delete(reason=f"Channel nuked by {interaction.user}")
-    await new_channel.send(embed=success_embed("💥  Channel Nuked", f"This channel was nuked by {interaction.user.mention}."))
-
-# ── .nickname ─────────────────────────────────────────────────────────────────
 @bot.command(name="nickname")
 @commands.has_permissions(manage_nicknames=True)
 async def nickname_prefix(ctx, user: discord.Member, *, nickname: str = None):
@@ -1093,19 +771,6 @@ async def nickname_prefix(ctx, user: discord.Member, *, nickname: str = None):
         f"{user.mention}'s nickname changed from `{old_nick}` to {new_text}."))
     await ctx.message.delete()
 
-@tree.command(name="nickname", description="Change a user's nickname")
-@app_commands.describe(user="User to rename", nickname="New nickname (leave empty to reset)")
-@app_commands.default_permissions(manage_nicknames=True)
-async def nickname_slash(interaction: discord.Interaction, user: discord.Member, nickname: str = None):
-    old_nick = user.display_name
-    await user.edit(nick=nickname, reason=f"Nickname changed by {interaction.user}")
-    new_text = f"`{nickname}`" if nickname else "removed"
-    await interaction.response.send_message(
-        embed=success_embed("✏️  Nickname Changed", f"{user.mention}: `{old_nick}` → {new_text}"),
-        ephemeral=True
-    )
-
-# ── .role ─────────────────────────────────────────────────────────────────────
 @bot.command(name="role")
 @commands.has_permissions(manage_roles=True)
 async def role_prefix(ctx, user: discord.Member, role: discord.Role):
@@ -1117,24 +782,6 @@ async def role_prefix(ctx, user: discord.Member, role: discord.Role):
         await ctx.send(embed=success_embed("➕  Role Added", f"Added {role.mention} to {user.mention}."))
     await ctx.message.delete()
 
-@tree.command(name="role", description="Add or remove a role from a user")
-@app_commands.describe(user="User", role="Role to add/remove")
-@app_commands.default_permissions(manage_roles=True)
-async def role_slash(interaction: discord.Interaction, user: discord.Member, role: discord.Role):
-    if role in user.roles:
-        await user.remove_roles(role, reason=f"Role removed by {interaction.user}")
-        await interaction.response.send_message(
-            embed=success_embed("➖  Role Removed", f"Removed {role.mention} from {user.mention}."),
-            ephemeral=True
-        )
-    else:
-        await user.add_roles(role, reason=f"Role added by {interaction.user}")
-        await interaction.response.send_message(
-            embed=success_embed("➕  Role Added", f"Added {role.mention} to {user.mention}."),
-            ephemeral=True
-        )
-
-# ── .note ─────────────────────────────────────────────────────────────────────
 @bot.command(name="note")
 @commands.has_permissions(manage_messages=True)
 async def note_prefix(ctx, user: discord.Member, *, note: str):
@@ -1145,20 +792,6 @@ async def note_prefix(ctx, user: discord.Member, *, note: str):
     })
     await ctx.send(embed=success_embed("📝  Note Added", f"Added a private note for {user.mention}."))
     await ctx.message.delete()
-
-@tree.command(name="note", description="Add a private moderator note about a user")
-@app_commands.describe(user="User", note="Note text")
-@app_commands.default_permissions(manage_messages=True)
-async def note_slash(interaction: discord.Interaction, user: discord.Member, note: str):
-    mod_notes.setdefault(user.id, []).append({
-        "note": note,
-        "by": str(interaction.user),
-        "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
-    })
-    await interaction.response.send_message(
-        embed=success_embed("📝  Note Added", f"Added a private note for {user.mention}."),
-        ephemeral=True
-    )
 
 @bot.command(name="notes")
 @commands.has_permissions(manage_messages=True)
@@ -1172,23 +805,6 @@ async def notes_prefix(ctx, user: discord.Member):
         embed.add_field(name=f"Note #{i}", value=f"{n['note']}\n— {n['by']} ({n['at']})", inline=False)
     await ctx.send(embed=embed)
 
-@tree.command(name="notes", description="View all moderator notes for a user")
-@app_commands.describe(user="User")
-@app_commands.default_permissions(manage_messages=True)
-async def notes_slash(interaction: discord.Interaction, user: discord.Member):
-    user_notes = mod_notes.get(user.id, [])
-    if not user_notes:
-        await interaction.response.send_message(
-            embed=discord.Embed(description=f"📝 No notes for {user.mention}.", color=0x5865F2),
-            ephemeral=True
-        )
-        return
-    embed = discord.Embed(title=f"📝  Notes for {user}", color=0x5865F2)
-    for i, n in enumerate(user_notes, 1):
-        embed.add_field(name=f"Note #{i}", value=f"{n['note']}\n— {n['by']} ({n['at']})", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ── .filter ───────────────────────────────────────────────────────────────────
 @bot.command(name="filter")
 @commands.has_permissions(manage_messages=True)
 async def filter_prefix(ctx, action: str, *, word: str = None):
@@ -1211,36 +827,6 @@ async def filter_prefix(ctx, action: str, *, word: str = None):
         await ctx.reply("Usage: `.filter add/remove/list [word]`", delete_after=10)
     await ctx.message.delete()
 
-@tree.command(name="filter", description="Manage the word filter")
-@app_commands.describe(action="Action: add, remove, or list", word="Word to add/remove")
-@app_commands.default_permissions(manage_messages=True)
-async def filter_slash(interaction: discord.Interaction, action: str, word: str = None):
-    if action.lower() == "add" and word:
-        word_filter.add(word.lower())
-        await interaction.response.send_message(
-            embed=success_embed("🚫  Word Added", f"`{word}` added to the filter."),
-            ephemeral=True
-        )
-    elif action.lower() == "remove" and word:
-        word_filter.discard(word.lower())
-        await interaction.response.send_message(
-            embed=success_embed("✅  Word Removed", f"`{word}` removed from the filter."),
-            ephemeral=True
-        )
-    elif action.lower() == "list":
-        if not word_filter:
-            await interaction.response.send_message(
-                embed=discord.Embed(description="🚫 No filtered words.", color=0x5865F2),
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(embed=discord.Embed(
-                title="🚫  Filtered Words",
-                description=", ".join(f"`{w}`" for w in sorted(word_filter)),
-                color=0xED4245
-            ), ephemeral=True)
-
-# ── Word filter listener ──────────────────────────────────────────────────────
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
@@ -1268,77 +854,22 @@ async def avatar_prefix(ctx, user: discord.Member = None):
     embed.set_image(url=user.display_avatar.url)
     await ctx.send(embed=embed)
 
-@tree.command(name="avatar", description="Show a user's avatar")
-@app_commands.describe(user="User (defaults to you)")
-async def avatar_slash(interaction: discord.Interaction, user: discord.Member = None):
-    user = user or interaction.user
-    embed = discord.Embed(title=f"{user}'s Avatar", color=0x5865F2)
-    embed.set_image(url=user.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
-
-# ── .serverinfo ───────────────────────────────────────────────────────────────
-@bot.command(name="serverinfo")
-async def serverinfo_prefix(ctx):
-    guild = ctx.guild
-    embed = discord.Embed(title=f"📊  {guild.name}", color=0x5865F2)
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-    embed.add_field(name="👑  Owner", value=guild.owner.mention, inline=True)
-    embed.add_field(name="👥  Members", value=guild.member_count, inline=True)
-    embed.add_field(name="📅  Created", value=guild.created_at.strftime("%d %b %Y"), inline=True)
-    embed.add_field(name="💬  Channels", value=len(guild.channels), inline=True)
-    embed.add_field(name="🎭  Roles", value=len(guild.roles), inline=True)
-    embed.add_field(name="😀  Emojis", value=len(guild.emojis), inline=True)
-    await ctx.send(embed=embed)
-
-@tree.command(name="serverinfo", description="Show server information")
-async def serverinfo_slash(interaction: discord.Interaction):
-    guild = interaction.guild
-    embed = discord.Embed(title=f"📊  {guild.name}", color=0x5865F2)
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-    embed.add_field(name="👑  Owner", value=guild.owner.mention, inline=True)
-    embed.add_field(name="👥  Members", value=guild.member_count, inline=True)
-    embed.add_field(name="📅  Created", value=guild.created_at.strftime("%d %b %Y"), inline=True)
-    embed.add_field(name="💬  Channels", value=len(guild.channels), inline=True)
-    embed.add_field(name="🎭  Roles", value=len(guild.roles), inline=True)
-    embed.add_field(name="😀  Emojis", value=len(guild.emojis), inline=True)
-    await interaction.response.send_message(embed=embed)
-
-# ── Auto-filter on message ────────────────────────────────────────────────────
 @bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
-        return
-    if await check_spam(message):
-        return
-    if filtered_words and any(word in message.content.lower() for word in filtered_words):
-        try:
-            await message.delete()
-            await message.channel.send(
-                f"{message.author.mention} your message contained a filtered word.", delete_after=5
-            )
-        except discord.Forbidden:
-            pass
-    await bot.process_commands(message)
+@bot.command(name="antiraid")
+@commands.has_permissions(administrator=True)
+async def antiraid_prefix(ctx, status: str):
+    global antiraid_enabled
+    if status.lower() == "on":
+        antiraid_enabled = True
+        await ctx.send(embed=success_embed("🛡️  Anti-Raid Enabled", "New accounts joining rapidly will be auto-kicked."))
+    elif status.lower() == "off":
+        antiraid_enabled = False
+        await ctx.send(embed=success_embed("🛡️  Anti-Raid Disabled", "Anti-raid protection is now off."))
+    else:
+        await ctx.reply("Usage: `.antiraid on/off`", delete_after=10)
+    await ctx.message.delete()
 
-# ── Auto-moderation listeners ─────────────────────────────────────────────────
 @bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
-    
-    # Word filter
-    if word_filter and any(word in message.content.lower() for word in word_filter):
-        try:
-            await message.delete()
-            await message.channel.send(
-                f"{message.author.mention} your message contained a filtered word.",
-                delete_after=5
-            )
-        except:
-            pass
-    
-    await bot.process_commands(message)
-
 @bot.event
 async def on_member_join(member):
     # Anti-raid: kick accounts < 7 days old
@@ -1362,22 +893,6 @@ async def reviewpanel_prefix(ctx, channel: discord.TextChannel):
         f"Chat ban review panels will now be sent to {channel.mention}."
     ))
     await ctx.message.delete()
-
-@tree.command(name="reviewpanel", description="Set the channel where chatban review panels are sent")
-@app_commands.describe(channel="Channel for review panels")
-@app_commands.default_permissions(administrator=True)
-async def reviewpanel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
-    global REVIEW_CHANNEL_ID
-    REVIEW_CHANNEL_ID = channel.id
-    await interaction.response.send_message(
-        embed=success_embed(
-            "✅  Review Channel Updated",
-            f"Chat ban review panels will now be sent to {channel.mention}."
-        ),
-        ephemeral=True
-    )
-
-# ── Events ────────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_command_completion(ctx):
@@ -1408,21 +923,6 @@ async def on_mention(message):
 
 
 @bot.event
-async def on_member_join(member):
-    """Log new member joins."""
-    channel = member.guild.system_channel
-    if channel:
-        account_age = (datetime.now(timezone.utc) - member.created_at).days
-        warning = f"⚠️ Account is only **{account_age} days old**" if account_age < 7 else ""
-        embed = discord.Embed(
-            title="📥  Member Joined",
-            description=f"{member.mention} joined the server.\n{warning}",
-            color=0x57F287
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text=f"ID: {member.id} • Account created {member.created_at.strftime('%d %b %Y')}")
-        await channel.send(embed=embed)
-
 @bot.event
 async def on_member_remove(member):
     """Log member leaves."""
@@ -1443,7 +943,7 @@ async def on_ready():
     await tree.sync()
     print("✅  Slash commands synced")
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="🛡️ /modhelp or .modhelp")
+        activity=discord.Activity(type=discord.ActivityType.watching, name="Watching over Sparky AI")
     )
 
 if __name__ == "__main__":
