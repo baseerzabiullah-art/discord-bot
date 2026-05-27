@@ -540,20 +540,55 @@ async def slowmode_prefix(ctx, seconds: int):
 @bot.command(name="modhelp")
 async def modhelp_prefix(ctx):
     embed = discord.Embed(title="🛡️  Moderation Commands", color=0x5865F2,
-        description="Use `.command` or `/command`. You can **@mention** users or use their ID.")
-    embed.add_field(name=".chatban @user [time] [reason]",  value="Remove chat perms temporarily", inline=False)
-    embed.add_field(name=".unchatban @user",                value="Lift a chat ban early", inline=False)
-    embed.add_field(name=".mute @user [time] [reason]",     value="Timeout a user", inline=False)
-    embed.add_field(name=".unmute @user",                   value="Remove timeout", inline=False)
-    embed.add_field(name=".kick @user [reason]",            value="Kick a user", inline=False)
-    embed.add_field(name=".ban @user [reason]",             value="Ban a user", inline=False)
-    embed.add_field(name=".unban [user_id]",                value="Unban a user", inline=False)
-    embed.add_field(name=".warn @user [reason]",            value="Warn a user", inline=False)
-    embed.add_field(name=".warnings @user",                 value="View warnings", inline=False)
-    embed.add_field(name=".clearwarnings @user",            value="Clear warnings", inline=False)
-    embed.add_field(name=".purge [amount]",                 value="Delete messages (max 100)", inline=False)
-    embed.add_field(name=".slowmode [seconds]",             value="Set slowmode (0 to disable)", inline=False)
-    embed.set_footer(text="Duration format: 30s / 10m / 2h / 1d")
+        description="Use `.command` or `?command` or `/command`. You can **@mention** users or use their ID.")
+    embed.add_field(name="📋  General", value=(
+        "`.usercheck @user` — Full mod history\n"
+        "`.reviewpanel #channel` — Set review channel\n"
+        "`.note @user [text]` — Add private mod note\n"
+        "`.notes @user` — View all notes"
+    ), inline=False)
+    embed.add_field(name="⚠️  Warnings & Bans", value=(
+        "`.warn @user [reason]` — Warn a user\n"
+        "`.warnings @user` — View warnings\n"
+        "`.clearwarnings @user` — Clear warnings\n"
+        "`.chatban @user [time] [reason]` — Remove chat perms\n"
+        "`.unchatban @user` — Lift chat ban"
+    ), inline=False)
+    embed.add_field(name="🔨  Kicks & Bans", value=(
+        "`.kick @user [reason]` — Kick user\n"
+        "`.ban @user [reason]` — Ban user\n"
+        "`.unban [id]` — Unban user"
+    ), inline=False)
+    embed.add_field(name="🔕  Mute & Timeout", value=(
+        "`.mute @user [time] [reason]` — Timeout\n"
+        "`.unmute @user` — Remove timeout"
+    ), inline=False)
+    embed.add_field(name="🔒  Channel Management", value=(
+        "`.lock [#channel]` — Lock channel\n"
+        "`.unlock [#channel]` — Unlock channel\n"
+        "`.lockdown` — Lock all channels\n"
+        "`.nuke [#channel]` — Clone & delete channel"
+    ), inline=False)
+    embed.add_field(name="✏️  User Management", value=(
+        "`.nickname @user [name]` — Change nickname\n"
+        "`.role @user [@role]` — Add/remove role\n"
+        "`.avatar [@user]` — Show avatar"
+    ), inline=False)
+    embed.add_field(name="🧹  Cleanup & Filter", value=(
+        "`.purge [amount]` — Delete messages (max 100)\n"
+        "`.slowmode [seconds]` — Set slowmode\n"
+        "`.filter add/remove/list [word]` — Manage word filter"
+    ), inline=False)
+    embed.add_field(name="ℹ️  Server Info", value=(
+        "`.serverinfo` — Server statistics\n"
+        "`.avatar [@user]` — View user avatar"
+    ), inline=False)
+    embed.add_field(name="📊  Auto Features", value=(
+        "**Auto-spam:** 6 messages in 10s → 5min mute\n"
+        "**Auto-escalation:** 3 warns→1d ban, 5 warns→1w ban, 6 warns→1mo ban\n"
+        "**Join/Leave logs:** New members logged with account age"
+    ), inline=False)
+    embed.set_footer(text="Duration: 30s / 10m / 2h / 1d  •  Prefix: . or ?  •  Watching over Sparky AI")
     await ctx.send(embed=embed)
 
 # ════════════════════════════════════════════════════════════════════════════════
