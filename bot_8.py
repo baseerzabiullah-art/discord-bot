@@ -869,6 +869,7 @@ async def antiraid_prefix(ctx, status: str):
     await ctx.message.delete()
 
 @bot.event
+@bot.event
 async def on_member_join(member):
     # Anti-raid: kick accounts < 7 days old
     if antiraid_enabled:
@@ -892,6 +893,7 @@ async def reviewpanel_prefix(ctx, channel: discord.TextChannel):
     ))
     await ctx.message.delete()
 
+@bot.event
 async def on_command_completion(ctx):
     """Auto-delete command messages after successful execution."""
     try:
@@ -901,6 +903,7 @@ async def on_command_completion(ctx):
         pass
 
 
+@bot.event  
 async def on_mention(message):
     """Respond when bot is mentioned."""
     if message.author.bot or not bot.user.mentioned_in(message):
@@ -918,6 +921,7 @@ async def on_mention(message):
     await message.reply(embed=embed, mention_author=False)
 
 
+@bot.event
 @bot.event
 async def on_member_remove(member):
     """Log member leaves."""
