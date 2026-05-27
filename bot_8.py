@@ -977,7 +977,7 @@ async def on_ready():
     await tree.sync()
     print("✅  Slash commands synced")
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="Watching over Sparky AI")
+        activity=discord.Activity(type=discord.ActivityType.watching, name="Watching over Sparky")
     )
 
 if __name__ == "__main__":
