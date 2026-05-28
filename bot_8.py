@@ -8,9 +8,6 @@ import time
 import asyncio
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ── Environment ─────────────────────────────────────────────────
 TOKEN    = os.getenv("DISCORD_TOKEN")
