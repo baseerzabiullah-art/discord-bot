@@ -1,1018 +1,1856 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
-import asyncio
-import re
-import os
-from datetime import datetime, timezone, timedelta
+================================================================================
+FILE: discord-bot/.env.example
+================================================================================
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# Discord Bot Token (from Discord Developer Portal)
+DISCORD_TOKEN=your_bot_token_here
 
-# Review channel where chatban panels are sent
-REVIEW_CHANNEL_ID = 1501244015738093618
+# Your Discord Server ID
+GUILD_ID=your_guild_id_here
 
-# ── Bot setup ─────────────────────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-bot = commands.Bot(command_prefix=[".", "?"], intents=intents)
-tree = bot.tree
-
-# ── In-memory warnings ────────────────────────────────────────────────────────
-warnings: dict[int, list[dict]] = {}
-
-async def apply_warning_escalation(guild, member, count, channel):
-    """Apply automatic punishment based on warning count."""
-
-    # 3 warnings → 1 day chat ban
-    if count == 3:
-        await channel.send(embed=discord.Embed(
-            title="🔇  Auto Chat Ban — 3 Warnings",
-            description=f"{member.mention} has reached **3 warnings** and has been chat banned for **1 day**.",
-            color=0xED4245,
-        ))
-        await do_chatban(guild, member, 86400, "Reached 3 warnings", guild.me)
-
-    # 5 warnings → 1 week chat ban + last warning DM
-    elif count == 5:
-        await channel.send(embed=discord.Embed(
-            title="🔇  Auto Chat Ban — 5 Warnings",
-            description=f"{member.mention} has reached **5 warnings** and has been chat banned for **1 week**.",
-            color=0xED4245,
-        ))
-        await do_chatban(guild, member, 604800, "Reached 5 warnings", guild.me)
-        try:
-            await member.send(embed=discord.Embed(
-                title="⚠️  Last Warning",
-                description="your on ur last warning, one more and you will be temporarily banned.",
-                color=0xFEE75C,
-            ))
-        except discord.Forbidden:
-            pass
-
-    # 6+ warnings → 1 month temp ban
-    elif count >= 6:
-        await channel.send(embed=discord.Embed(
-            title="🔨  Auto Temp Ban — 6 Warnings",
-            description=f"{member.mention} has reached **{count} warnings** and has been temporarily banned for **1 month**.",
-            color=0xED4245,
-        ))
-        try:
-            await member.send(embed=discord.Embed(
-                title="🔨  You've been temporarily banned",
-                description=(
-                    f"You have been temporarily banned from **{guild.name}** for 1 month "
-                    f"due to reaching {count} warnings."
-                ),
-                color=0xED4245,
-            ))
-        except discord.Forbidden:
-            pass
-        await member.ban(reason=f"Reached {count} warnings — auto temp ban (1 month)")
-        async def unban_after(g=guild, m=member):
-            await asyncio.sleep(2592000)
-            try:
-                await g.unban(m, reason="Temp ban (1 month) expired")
-                await m.send(embed=discord.Embed(
-                    title="✅  Ban Lifted",
-                    description=f"Your 1 month ban from **{g.name}** has expired. You may rejoin.",
-                    color=0x57F287,
-                ))
-            except Exception:
-                pass
-        asyncio.create_task(unban_after())
+# Your Discord User ID (bot owner)
+OWNER_ID=your_user_id_here
 
 
 
-# ── Additional mod stores ─────────────────────────────────────────────────────
-mod_notes: dict[int, list[dict]] = {}
-word_filter: set[str] = set()
-antiraid_enabled = False
-antispam_enabled = False
+================================================================================
+FILE: discord-bot/.gitignore
+================================================================================
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def parse_duration(time_str: str):
-    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    match = re.fullmatch(r"(\d+)([smhd])", time_str.strip().lower())
-    if not match:
-        return None
-    amount, unit = int(match.group(1)), match.group(2)
-    return amount * units[unit]
-
-def error_embed(desc): return discord.Embed(title="⚠️  Error", description=desc, color=0xED4245)
-def success_embed(title, desc): return discord.Embed(title=title, description=desc, color=0x57F287)
-
-async def get_member(guild, user):
-    """Accept a Member object or int ID."""
-    if isinstance(user, (discord.Member, discord.User)):
-        return guild.get_member(user.id) or await guild.fetch_member(user.id)
-    try:
-        return await guild.fetch_member(int(user))
-    except Exception:
-        return None
+node_modules/
+.env
+data/
+*.log
 
 
-# ── Chatban Review Panel ──────────────────────────────────────────────────────
-class ChatbanReviewView(discord.ui.View):
-    def __init__(self, guild_id, member_id, original_seconds, reason, moderator_id):
-        super().__init__(timeout=None)
-        self.guild_id        = guild_id
-        self.member_id       = member_id
-        self.original_seconds = original_seconds
-        self.reason          = reason
-        self.moderator_id    = moderator_id
-        self.resolved        = False
 
-    async def _resolve(self, interaction, action_embed):
-        if self.resolved:
-            await interaction.response.send_message(
-                embed=error_embed("This case has already been resolved."), ephemeral=True
-            )
-            return False
-        self.resolved = True
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
-        return True
+================================================================================
+FILE: discord-bot/README.md
+================================================================================
 
-    @discord.ui.button(label="⬆️  Increase Ban", style=discord.ButtonStyle.danger, custom_id="review_increase")
-    async def increase_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(embed=error_embed("Administrators only."), ephemeral=True); return
-        await interaction.response.send_modal(AdjustBanModal(self, action="increase"))
+# Sparky AI Moderation Bot
 
-    @discord.ui.button(label="⬇️  Decrease Ban", style=discord.ButtonStyle.primary, custom_id="review_decrease")
-    async def decrease_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(embed=error_embed("Administrators only."), ephemeral=True); return
-        await interaction.response.send_modal(AdjustBanModal(self, action="decrease"))
+A production-ready Discord moderation bot with prefix commands (`.` / `?`) and slash commands.
 
-    @discord.ui.button(label="✅  Remove Ban", style=discord.ButtonStyle.success, custom_id="review_remove")
-    async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(embed=error_embed("Administrators only."), ephemeral=True); return
-        if not await self._resolve(interaction, None):
-            return
-        guild  = bot.get_guild(self.guild_id)
-        member = guild.get_member(self.member_id)
-        if member:
-            for channel in guild.text_channels:
-                try:
-                    await channel.set_permissions(member, send_messages=None,
-                                          add_reactions=None,
-                                          create_public_threads=None,
-                                          create_private_threads=None,
-                                          send_messages_in_threads=None, reason=f"Chatban removed by {interaction.user}")
-                except discord.Forbidden:
-                    pass
-            try:
-                await member.send(embed=discord.Embed(
-                    title="🔊  Chat Ban Removed",
-                    description=f"Your chat ban in **{guild.name}** has been reviewed and removed by a higher up.",
-                    color=0x57F287,
-                ))
-            except discord.Forbidden:
-                pass
+---
 
-        result_embed = discord.Embed(
-            title="✅  Chat Ban Removed",
-            description=(
-                f"**User:** <@{self.member_id}>\n**Action:** Ban fully removed\n**Reviewed by:** {interaction.user.mention}"
-            ),
-            color=0x57F287,
-        )
-        await interaction.message.edit(embed=result_embed, view=self)
-        await interaction.response.send_message(embed=success_embed("✅  Done", "Chat ban removed."), ephemeral=True)
+## 🚀 Setup
 
-    @discord.ui.button(label="✔️  Keep Ban", style=discord.ButtonStyle.secondary, custom_id="review_keep")
-    async def keep_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(embed=error_embed("Administrators only."), ephemeral=True); return
-        if not await self._resolve(interaction, None):
-            return
-        result_embed = discord.Embed(
-            title="✔️  Chat Ban Kept",
-            description=(
-                f"**User:** <@{self.member_id}>\n**Decision:** Original ban upheld\n**Reviewed by:** {interaction.user.mention}"
-            ),
-            color=0x5865F2,
-        )
-        await interaction.message.edit(embed=result_embed, view=self)
-        await interaction.response.send_message(embed=success_embed("✅  Done", "Ban upheld."), ephemeral=True)
+### 1. Prerequisites
+- Node.js 18+ installed
+- A Discord bot application from the [Developer Portal](https://discord.com/developers/applications)
+
+### 2. Bot Permissions
+When inviting your bot, ensure it has these permissions:
+- **Administrator** (recommended for full functionality)
+
+OR individually:
+- Manage Channels, Manage Roles, Manage Nicknames
+- Kick Members, Ban Members
+- Moderate Members (for timeouts)
+- Manage Messages
+- Read/Send Messages, View Channels
+
+Enable these **Privileged Gateway Intents** in the Developer Portal:
+- ✅ Server Members Intent
+- ✅ Message Content Intent
+
+### 3. Installation
+```bash
+git clone <your-repo>
+cd discord-bot
+npm install
+cp .env.example .env
+```
+
+Edit `.env`:
+```
+DISCORD_TOKEN=your_bot_token_here
+GUILD_ID=your_server_id_here        # For instant slash command registration
+OWNER_ID=your_discord_user_id_here  # For ghost pings on bans
+```
+
+### 4. Run
+```bash
+npm start
+```
+
+---
+
+## 🚂 Railway Deployment
+
+1. Push this project to a GitHub repository
+2. Create a new project on [Railway](https://railway.app)
+3. Connect your GitHub repository
+4. Add environment variables in Railway's dashboard:
+   - `DISCORD_TOKEN`
+   - `GUILD_ID`
+   - `OWNER_ID`
+5. Deploy — Railway will auto-start with `node index.js`
+
+The bot will run 24/7. Railway's free tier offers 500 hours/month.
+
+---
+
+## 📋 Commands
+
+All commands work with `.command`, `?command`, and `/command`.
+
+### Warnings
+| Command | Description |
+|---|---|
+| `warn <user> [reason]` | Warn a user (auto-escalates at 3/5/6 warnings) |
+| `warnings <user>` | View all warnings for a user |
+| `delwarn <user> <id>` | Delete a specific warning |
+
+**Auto-escalation:**
+- 3 warnings → 1-day chatban
+- 5 warnings → 1-week chatban + final warning DM
+- 6+ warnings → 1-month temporary ban
+
+### Chat Restrictions
+| Command | Description |
+|---|---|
+| `chatban <user> [reason]` | Block all chat access across every channel |
+| `unchatban <user>` | Remove a chatban |
+| `mute <user> <duration> [reason]` | Discord timeout (e.g. `10m`, `1h`, `2d`, `1w`) |
+| `unmute <user>` | Remove a timeout |
+
+### Moderation
+| Command | Description |
+|---|---|
+| `kick <user> [reason]` | Kick a member |
+| `ban <user> [reason]` | Ban a user |
+| `unban <id> [reason]` | Unban a user by ID |
+
+### User Info
+| Command | Description |
+|---|---|
+| `usercheck <user>` | Full mod profile: join date, warnings, actions, possible alts |
+| `avatar [user]` | Show user's avatar |
+| `serverinfo` | Server statistics |
+| `note <user> <text>` | Add a private mod note |
+| `notes <user>` | View all notes for a user |
+| `delnote <user> <id>` | Delete a note |
+
+### Channel Management
+| Command | Description |
+|---|---|
+| `lock` | Lock current channel |
+| `unlock` | Unlock current channel |
+| `lockdown` | Lock ALL channels |
+| `unlockall` | Unlock ALL channels |
+| `nuke` | Clone & delete channel (wipes all messages) |
+| `slowmode <seconds>` | Set slowmode (0 to disable) |
+| `purge <amount>` | Delete 1–100 messages |
+
+### User Management
+| Command | Description |
+|---|---|
+| `nickname <user> [name]` | Force change nickname (omit name to reset) |
+| `role <user> <role>` | Toggle a role on a user |
+
+### Filter
+| Command | Description |
+|---|---|
+| `filter add <word>` | Add word to automod filter |
+| `filter remove <word>` | Remove word from filter |
+| `filter list` | List all filtered words |
+
+### Config & Logging
+| Command | Description |
+|---|---|
+| `logschannel <#channel>` | Set the mod logs channel |
+| `reviewpanel <user>` | Open chatban review panel with action buttons |
+| `help` | Show all commands |
+
+---
+
+## 🤖 Auto Features
+
+- **Spam Detection:** 6+ messages in 10 seconds → 5-minute automatic timeout
+- **Word Filter:** Auto-deletes messages containing banned words
+- **Join Logs:** Logs new members with account age warning if < 7 days old
+- **Leave Logs:** Logs members who leave
+- **Ban Logs:** Ghost pings server owner on manual bans
+- **Status:** `Watching over Sparky AI`
+
+---
+
+## 📁 File Structure
+
+```
+discord-bot/
+├── index.js                  # Entry point
+├── package.json
+├── railway.toml              # Railway deployment config
+├── .env.example
+├── commands/
+│   └── moderation.js         # All command handlers
+├── events/
+│   └── handlers.js           # Event listeners
+├── utils/
+│   ├── database.js           # JSON-based data storage
+│   ├── helpers.js            # Embeds, permissions, utilities
+│   ├── chatban.js            # Chatban apply/remove logic
+│   └── registerCommands.js   # Slash command registration
+└── data/                     # Auto-created, stores JSON data
+    ├── warnings.json
+    ├── modactions.json
+    ├── notes.json
+    ├── config.json
+    ├── filter.json
+    └── chatbans.json
+```
+
+---
+
+## ⚠️ Notes
+
+- Data is stored in JSON files in the `/data` directory. For production at scale, consider migrating to SQLite or a database.
+- On Railway, the `/data` directory persists between deployments as long as you don't change the volume. Consider using Railway Volumes for persistent storage.
+- The bot registers slash commands to your `GUILD_ID` for instant availability. Remove `GUILD_ID` to register globally (takes up to 1 hour to propagate).
 
 
-class AdjustBanModal(discord.ui.Modal, title="Adjust Chat Ban Duration"):
-    async def on_submit(self, interaction: discord.Interaction):
-        seconds = parse_duration(self.new_duration.value.strip())
-        if not seconds:
-            await interaction.response.send_message(
-                embed=error_embed("Invalid duration. Use `30m`, `6h`, `3d` etc."), ephemeral=True
-            )
-            return
 
-        if not await self.review_view._resolve(interaction, None):
-            return
+================================================================================
+FILE: discord-bot/index.js
+================================================================================
 
-        guild  = bot.get_guild(self.review_view.guild_id)
-        member = guild.get_member(self.review_view.member_id)
+require('dotenv').config();
+const { Client, GatewayIntentBits, Partials, ActivityType } = require('discord.js');
+const { handleMessage, handleInteraction, handleMemberAdd, handleMemberRemove } = require('./events/handlers');
+const { registerCommands } = require('./utils/registerCommands');
 
-        action_word = "increased" if self.action == "increase" else "decreased"
-        color       = 0xED4245 if self.action == "increase" else 0x5865F2
+// ── Validate environment ────────────────────────────────────────
+if (!process.env.DISCORD_TOKEN) {
+  console.error('[ERROR] DISCORD_TOKEN is not set. Please check your .env file.');
+  process.exit(1);
+}
 
-        if member:
-            # Reset permissions then reapply with new duration
-            for channel in guild.text_channels:
-                try:
-                    await channel.set_permissions(member, send_messages=False,
-                                          add_reactions=False,
-                                          create_public_threads=False,
-                                          create_private_threads=False,
-                                          send_messages_in_threads=False,
-                                                  reason=f"Chatban {action_word} by {interaction.user}")
-                except discord.Forbidden:
-                    pass
-            expiry_ts = int(datetime.now(timezone.utc).timestamp()) + seconds
-            try:
-                await member.send(embed=discord.Embed(
-                    title="🔇  Chat Ban Adjusted",
-                    description=(
-                        f"Your chat ban in **{guild.name}** has been {action_word} by a higher up.\n\n"
-                        f"**New duration:** `{self.new_duration.value}`\n"
-                        f"**Expires:** <t:{expiry_ts}:R>"
-                    ),
-                    color=color,
-                ))
-            except discord.Forbidden:
-                pass
-            asyncio.create_task(_chatban_expire(guild, member, seconds))
+// ── Create client ───────────────────────────────────────────────
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.GuildMember]
+});
 
-        result_embed = discord.Embed(
-            title=f"{'⬆️' if self.action == 'increase' else '⬇️'}  Chat Ban {action_word.capitalize()}",
-            description=(
-                f"**User:** <@{self.review_view.member_id}>\n"
-                f"**New Duration:** `{self.new_duration.value}`\n"
-                f"**Reviewed by:** {interaction.user.mention}"
-            ),
-            color=color,
-        )
-        await interaction.message.edit(embed=result_embed, view=self.review_view)
-        await interaction.response.send_message(
-            embed=success_embed("✅  Done", f"Chat ban {action_word} to `{self.new_duration.value}`."), ephemeral=True
-        )
+// ── Ready ───────────────────────────────────────────────────────
+client.once('ready', async () => {
+  console.log(`[READY] Logged in as ${client.user.tag}`);
+
+  client.user.setPresence({
+    activities: [{ name: 'over Sparky AI', type: ActivityType.Watching }],
+    status: 'online'
+  });
+
+  await registerCommands();
+  console.log('[READY] Bot is fully operational.');
+});
+
+// ── Events ──────────────────────────────────────────────────────
+client.on('messageCreate', handleMessage);
+client.on('interactionCreate', handleInteraction);
+client.on('guildMemberAdd', handleMemberAdd);
+client.on('guildMemberRemove', handleMemberRemove);
+
+// ── Error handling ──────────────────────────────────────────────
+client.on('error', err => console.error('[CLIENT ERROR]', err));
+client.on('warn', info => console.warn('[CLIENT WARN]', info));
+process.on('unhandledRejection', err => console.error('[UNHANDLED REJECTION]', err));
+process.on('uncaughtException', err => { console.error('[UNCAUGHT EXCEPTION]', err); process.exit(1); });
+
+// ── Login ───────────────────────────────────────────────────────
+client.login(process.env.DISCORD_TOKEN);
 
 
-async def send_review_panel(guild, member, seconds, reason, moderator):
-    """Send a chatban review panel to the review channel."""
-    review_channel = guild.get_channel(REVIEW_CHANNEL_ID)
-    if not review_channel:
-        return
 
-    expiry_ts = int(datetime.now(timezone.utc).timestamp()) + seconds
-    hours     = seconds // 3600
-    duration_str = (
-        f"{seconds // 86400}d" if seconds >= 86400
-        else f"{hours}h" if seconds >= 3600
-        else f"{seconds // 60}m" if seconds >= 60
-        else f"{seconds}s"
+================================================================================
+FILE: discord-bot/package.json
+================================================================================
+
+{
+  "name": "sparky-moderation-bot",
+  "version": "1.0.0",
+  "description": "Full-featured Discord moderation bot for Sparky AI",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
+
+
+================================================================================
+FILE: discord-bot/railway.toml
+================================================================================
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "node index.js"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+
+
+================================================================================
+FILE: discord-bot/events/handlers.js
+================================================================================
+
+const { EmbedBuilder, Events, PermissionFlagsBits } = require('discord.js');
+const db = require('../utils/database');
+const { commands } = require('../commands/moderation');
+const {
+  successEmbed, errorEmbed, warnEmbed, infoEmbed, modEmbed,
+  resolveUser, accountAgeDays, sendLog
+} = require('../utils/helpers');
+const { applyChatban, removeChatban } = require('../utils/chatban');
+
+// ── Spam tracking (in-memory) ───────────────────────────────────
+const spamMap = new Map(); // userId -> [timestamp, ...]
+
+// ── Prefix check ───────────────────────────────────────────────
+const PREFIXES = ['.', '?'];
+
+// ═══════════════════════════════════════════════════════════════
+//  MESSAGE CREATE
+// ═══════════════════════════════════════════════════════════════
+async function handleMessage(message) {
+  if (message.author.bot || !message.guild) return;
+
+  // ── Word filter ────────────────────────────────────────────
+  const filterWords = db.getFilterWords(message.guild.id);
+  if (filterWords.length) {
+    const lower = message.content.toLowerCase();
+    if (filterWords.some(w => lower.includes(w))) {
+      await message.delete().catch(() => null);
+      const warn = await message.channel.send({
+        embeds: [warnEmbed('Message Filtered', `${message.author}, your message was removed for containing a banned word.`)]
+      });
+      setTimeout(() => warn.delete().catch(() => null), 5000);
+      return;
+    }
+  }
+
+  // ── Anti-spam: 6+ messages in 10s → 5min timeout ─────────
+  const now = Date.now();
+  const uid = message.author.id;
+  if (!spamMap.has(uid)) spamMap.set(uid, []);
+  const timestamps = spamMap.get(uid).filter(t => now - t < 10000);
+  timestamps.push(now);
+  spamMap.set(uid, timestamps);
+
+  if (timestamps.length >= 6) {
+    spamMap.set(uid, []);
+    const member = message.member;
+    if (member && !member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+      try {
+        await member.timeout(5 * 60 * 1000, 'Auto: spam detection (6+ messages in 10s)');
+        const embed = modEmbed('Auto Mute (Spam)', message.client.user, message.author, 'Spam detection triggered', { Duration: '5 minutes' });
+        embed.setColor(0xFEE75C);
+        await sendLog(message.guild, embed, db);
+
+        const warn = await message.channel.send({
+          embeds: [warnEmbed('Spam Detected', `${message.author} has been muted for 5 minutes for spamming.`)]
+        });
+        setTimeout(() => warn.delete().catch(() => null), 6000);
+      } catch {}
+    }
+    return;
+  }
+
+  // ── Prefix command dispatch ────────────────────────────────
+  const prefix = PREFIXES.find(p => message.content.startsWith(p));
+  if (!prefix) return;
+
+  const args = message.content.slice(prefix.length).trim().split(/\s+/);
+  const commandName = args.shift().toLowerCase();
+  if (!commandName) return;
+
+  const handler = commands[commandName];
+  if (!handler) return;
+
+  // Build ctx object
+  const ctx = {
+    client: message.client,
+    guild: message.guild,
+    channel: message.channel,
+    member: message.member,
+    user: message.author,
+    args,
+    message,
+    reply: (opts) => message.reply(opts)
+  };
+
+  try {
+    await handler(ctx);
+  } catch (err) {
+    console.error(`[CMD ERROR] ${commandName}:`, err);
+    message.reply({ embeds: [errorEmbed('Error', `An error occurred: ${err.message}`)] }).catch(() => null);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  INTERACTION CREATE (slash commands + buttons)
+// ═══════════════════════════════════════════════════════════════
+async function handleInteraction(interaction) {
+  // ── Slash commands ─────────────────────────────────────────
+  if (interaction.isChatInputCommand()) {
+    const { commandName } = interaction;
+    const handler = commands[commandName];
+    if (!handler) return;
+
+    await interaction.deferReply({ ephemeral: false }).catch(() => null);
+
+    const args = buildArgsFromSlash(interaction);
+
+    const ctx = {
+      client: interaction.client,
+      guild: interaction.guild,
+      channel: interaction.channel,
+      member: interaction.member,
+      user: interaction.user,
+      args,
+      interaction,
+      reply: async (opts) => {
+        try {
+          if (interaction.deferred || interaction.replied) {
+            return await interaction.editReply(opts);
+          }
+          return await interaction.reply(opts);
+        } catch {}
+      }
+    };
+
+    try {
+      await handler(ctx);
+    } catch (err) {
+      console.error(`[SLASH ERROR] ${commandName}:`, err);
+      ctx.reply({ embeds: [errorEmbed('Error', err.message)], ephemeral: true }).catch(() => null);
+    }
+  }
+
+  // ── Chatban review buttons ─────────────────────────────────
+  if (interaction.isButton()) {
+    const [prefix, action, userId] = interaction.customId.split('_');
+    if (prefix !== 'cbr') return;
+
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+      return interaction.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')], ephemeral: true });
+    }
+
+    const user = await interaction.client.users.fetch(userId).catch(() => null);
+    if (!user) return interaction.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')], ephemeral: true });
+
+    await interaction.deferUpdate().catch(() => null);
+
+    if (action === 'remove') {
+      await removeChatban(interaction.guild, userId);
+      db.addModAction(interaction.guild.id, userId, { type: 'UNCHATBAN', moderatorId: interaction.user.id, reason: 'Review panel: removed' });
+      await interaction.followUp({ embeds: [successEmbed('Chatban Removed', `${user.tag}'s chatban has been lifted.`)], ephemeral: false });
+      await sendLog(interaction.guild, modEmbed('Chatban Removed (Panel)', interaction.user, user, 'Review panel decision'), db);
+
+    } else if (action === 'increase') {
+      // Extend to permanent (remove expiry)
+      const existing = db.getChatban(interaction.guild.id, userId);
+      if (existing) {
+        existing.expiresAt = null;
+        db.setChatban(interaction.guild.id, userId, existing);
+      } else {
+        await applyChatban(interaction.guild, userId, 'Review panel: increased', interaction.user.id);
+      }
+      await interaction.followUp({ embeds: [warnEmbed('Ban Increased', `${user.tag}'s chatban has been made permanent.`)], ephemeral: false });
+
+    } else if (action === 'decrease') {
+      // Reduce to 1 day from now
+      const newExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      const existing = db.getChatban(interaction.guild.id, userId);
+      if (existing) {
+        existing.expiresAt = newExpiry.toISOString();
+        db.setChatban(interaction.guild.id, userId, existing);
+      }
+      await interaction.followUp({ embeds: [successEmbed('Ban Decreased', `${user.tag}'s chatban reduced to 1 day.`)], ephemeral: false });
+
+    } else if (action === 'keep') {
+      await interaction.followUp({ embeds: [infoEmbed('No Change', `${user.tag}'s chatban has been kept as-is.`)], ephemeral: true });
+    }
+  }
+}
+
+// ── Build args array from slash interaction options ─────────────
+function buildArgsFromSlash(interaction) {
+  const args = [];
+  const user = interaction.options.getUser?.('user') || interaction.options.getMember?.('user');
+  const target = interaction.options.getUser?.('target');
+  const role = interaction.options.getRole?.('role');
+
+  if (user) args.push(user.id);
+  else if (target) args.push(target.id);
+
+  const duration = interaction.options.getString?.('duration');
+  if (duration) args.push(duration);
+
+  const reason = interaction.options.getString?.('reason');
+  if (reason) args.push(reason);
+
+  const amount = interaction.options.getInteger?.('amount');
+  if (amount) args[0] = String(amount); // purge case
+
+  const channel = interaction.options.getChannel?.('channel');
+  if (channel) args[0] = channel.id;
+
+  const word = interaction.options.getString?.('word');
+  const subcommand = interaction.options.getSubcommand?.(false);
+  if (subcommand) { args.unshift(subcommand); if (word) args.push(word); }
+
+  if (role) args.push(role.id);
+
+  const nickname = interaction.options.getString?.('nickname');
+  if (nickname) args.push(nickname);
+
+  return args;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GUILD MEMBER ADD
+// ═══════════════════════════════════════════════════════════════
+async function handleMemberAdd(member) {
+  const cfg = db.getConfig(member.guild.id);
+  if (!cfg.logsChannelId) return;
+
+  const ch = member.guild.channels.cache.get(cfg.logsChannelId);
+  if (!ch) return;
+
+  const ageDays = accountAgeDays(member.user);
+  const embed = new EmbedBuilder()
+    .setColor(ageDays < 7 ? 0xFEE75C : 0x57F287)
+    .setTitle(`📥 Member Joined${ageDays < 7 ? ' ⚠️ NEW ACCOUNT' : ''}`)
+    .setThumbnail(member.user.displayAvatarURL())
+    .addFields(
+      { name: 'User', value: `${member.user.tag} (\`${member.user.id}\`)`, inline: true },
+      { name: 'Account Age', value: `${ageDays} days`, inline: true },
+      { name: 'Created', value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },
+      { name: 'Total Members', value: `${member.guild.memberCount}`, inline: true }
     )
+    .setTimestamp();
 
-    embed = discord.Embed(
-        title="📋  Chat Ban Review Request",
-        description=(
-            "A chat ban has been issued. Higher ups can review and adjust it below."
-        ),
-        color=0xFEE75C,
+  if (ageDays < 7) embed.setDescription('⚠️ **This account is less than 7 days old!**');
+
+  ch.send({ embeds: [embed] }).catch(() => null);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GUILD MEMBER REMOVE
+// ═══════════════════════════════════════════════════════════════
+async function handleMemberRemove(member) {
+  const cfg = db.getConfig(member.guild.id);
+  if (!cfg.logsChannelId) return;
+
+  const ch = member.guild.channels.cache.get(cfg.logsChannelId);
+  if (!ch) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xED4245)
+    .setTitle('📤 Member Left')
+    .setThumbnail(member.user.displayAvatarURL())
+    .addFields(
+      { name: 'User', value: `${member.user.tag} (\`${member.user.id}\`)`, inline: true },
+      { name: 'Joined', value: member.joinedAt ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>` : 'Unknown', inline: true },
+      { name: 'Total Members', value: `${member.guild.memberCount}`, inline: true }
     )
-    embed.add_field(name="👤  User",       value=f"{member.mention} (`{member.id}`)", inline=False)
-    embed.add_field(name="⏱️  Duration",   value=f"`{duration_str}`", inline=True)
-    embed.add_field(name="⌛  Expires",    value=f"<t:{expiry_ts}:R>", inline=True)
-    embed.add_field(name="📝  Reason",     value=reason, inline=False)
-    embed.add_field(name="🛡️  Issued by",  value=moderator.mention, inline=False)
-    embed.set_footer(text="Only administrators can action this panel")
+    .setTimestamp();
 
-    view = ChatbanReviewView(
-        guild_id=guild.id,
-        member_id=member.id,
-        original_seconds=seconds,
-        reason=reason,
-        moderator_id=moderator.id,
+  ch.send({ embeds: [embed] }).catch(() => null);
+}
+
+module.exports = { handleMessage, handleInteraction, handleMemberAdd, handleMemberRemove };
+
+
+
+================================================================================
+FILE: discord-bot/utils/chatban.js
+================================================================================
+
+const { PermissionFlagsBits } = require('discord.js');
+const db = require('./database');
+
+const CHATBAN_DENIED = [
+  PermissionFlagsBits.SendMessages,
+  PermissionFlagsBits.AddReactions,
+  PermissionFlagsBits.CreatePublicThreads,
+  PermissionFlagsBits.CreatePrivateThreads,
+  PermissionFlagsBits.SendMessagesInThreads
+];
+
+async function applyChatban(guild, userId, reason, moderatorId, duration = null) {
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return false;
+
+  const channels = guild.channels.cache.filter(c =>
+    c.isTextBased() && c.permissionsFor && !c.isThread()
+  );
+
+  for (const [, channel] of channels) {
+    try {
+      await channel.permissionOverwrites.edit(userId, {
+        SendMessages: false,
+        AddReactions: false,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false,
+        SendMessagesInThreads: false
+      });
+    } catch {}
+  }
+
+  db.setChatban(guild.id, userId, {
+    moderatorId,
+    reason,
+    appliedAt: new Date().toISOString(),
+    expiresAt: duration ? new Date(Date.now() + duration).toISOString() : null
+  });
+
+  return true;
+}
+
+async function removeChatban(guild, userId) {
+  const member = await guild.members.fetch(userId).catch(() => null);
+  const channels = guild.channels.cache.filter(c =>
+    c.isTextBased() && c.permissionsFor && !c.isThread()
+  );
+
+  for (const [, channel] of channels) {
+    try {
+      const overwrite = channel.permissionOverwrites.cache.get(userId);
+      if (overwrite) await overwrite.delete();
+    } catch {}
+  }
+
+  db.removeChatban(guild.id, userId);
+  return true;
+}
+
+module.exports = { applyChatban, removeChatban };
+
+
+
+================================================================================
+FILE: discord-bot/utils/database.js
+================================================================================
+
+const fs = require('fs');
+const path = require('path');
+
+const DATA_DIR = path.join(__dirname, '..', 'data');
+
+// Ensure data directory exists
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function loadData(filename) {
+  const filepath = path.join(DATA_DIR, filename);
+  if (!fs.existsSync(filepath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(filepath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveData(filename, data) {
+  const filepath = path.join(DATA_DIR, filename);
+  fs.writeFileSync(filepath, JSON.stringify(data, null, 2));
+}
+
+// --- WARNINGS ---
+function getWarnings(guildId, userId) {
+  const data = loadData('warnings.json');
+  return data[guildId]?.[userId] || [];
+}
+
+function addWarning(guildId, userId, moderatorId, reason) {
+  const data = loadData('warnings.json');
+  if (!data[guildId]) data[guildId] = {};
+  if (!data[guildId][userId]) data[guildId][userId] = [];
+  const warning = {
+    id: Date.now(),
+    moderatorId,
+    reason,
+    timestamp: new Date().toISOString()
+  };
+  data[guildId][userId].push(warning);
+  saveData('warnings.json', data);
+  return data[guildId][userId];
+}
+
+function removeWarning(guildId, userId, warningId) {
+  const data = loadData('warnings.json');
+  if (!data[guildId]?.[userId]) return false;
+  const before = data[guildId][userId].length;
+  data[guildId][userId] = data[guildId][userId].filter(w => w.id !== warningId);
+  saveData('warnings.json', data);
+  return data[guildId][userId].length < before;
+}
+
+function clearWarnings(guildId, userId) {
+  const data = loadData('warnings.json');
+  if (!data[guildId]) return;
+  data[guildId][userId] = [];
+  saveData('warnings.json', data);
+}
+
+// --- MOD ACTIONS LOG ---
+function addModAction(guildId, userId, action) {
+  const data = loadData('modactions.json');
+  if (!data[guildId]) data[guildId] = {};
+  if (!data[guildId][userId]) data[guildId][userId] = [];
+  data[guildId][userId].push({ ...action, timestamp: new Date().toISOString() });
+  saveData('modactions.json', data);
+}
+
+function getModActions(guildId, userId) {
+  const data = loadData('modactions.json');
+  return data[guildId]?.[userId] || [];
+}
+
+// --- NOTES ---
+function addNote(guildId, userId, moderatorId, note) {
+  const data = loadData('notes.json');
+  if (!data[guildId]) data[guildId] = {};
+  if (!data[guildId][userId]) data[guildId][userId] = [];
+  const entry = { id: Date.now(), moderatorId, note, timestamp: new Date().toISOString() };
+  data[guildId][userId].push(entry);
+  saveData('notes.json', data);
+  return entry;
+}
+
+function getNotes(guildId, userId) {
+  const data = loadData('notes.json');
+  return data[guildId]?.[userId] || [];
+}
+
+function removeNote(guildId, userId, noteId) {
+  const data = loadData('notes.json');
+  if (!data[guildId]?.[userId]) return false;
+  const before = data[guildId][userId].length;
+  data[guildId][userId] = data[guildId][userId].filter(n => n.id !== noteId);
+  saveData('notes.json', data);
+  return data[guildId][userId].length < before;
+}
+
+// --- CONFIG (logs channel, etc.) ---
+function getConfig(guildId) {
+  const data = loadData('config.json');
+  return data[guildId] || {};
+}
+
+function setConfig(guildId, key, value) {
+  const data = loadData('config.json');
+  if (!data[guildId]) data[guildId] = {};
+  data[guildId][key] = value;
+  saveData('config.json', data);
+}
+
+// --- FILTER WORDS ---
+function getFilterWords(guildId) {
+  const data = loadData('filter.json');
+  return data[guildId] || [];
+}
+
+function addFilterWord(guildId, word) {
+  const data = loadData('filter.json');
+  if (!data[guildId]) data[guildId] = [];
+  if (!data[guildId].includes(word.toLowerCase())) {
+    data[guildId].push(word.toLowerCase());
+    saveData('filter.json', data);
+    return true;
+  }
+  return false;
+}
+
+function removeFilterWord(guildId, word) {
+  const data = loadData('filter.json');
+  if (!data[guildId]) return false;
+  const before = data[guildId].length;
+  data[guildId] = data[guildId].filter(w => w !== word.toLowerCase());
+  saveData('filter.json', data);
+  return data[guildId].length < before;
+}
+
+// --- CHATBANS ---
+function setChatban(guildId, userId, data_) {
+  const data = loadData('chatbans.json');
+  if (!data[guildId]) data[guildId] = {};
+  data[guildId][userId] = data_;
+  saveData('chatbans.json', data);
+}
+
+function getChatban(guildId, userId) {
+  const data = loadData('chatbans.json');
+  return data[guildId]?.[userId] || null;
+}
+
+function removeChatban(guildId, userId) {
+  const data = loadData('chatbans.json');
+  if (!data[guildId]) return;
+  delete data[guildId][userId];
+  saveData('chatbans.json', data);
+}
+
+module.exports = {
+  getWarnings, addWarning, removeWarning, clearWarnings,
+  addModAction, getModActions,
+  addNote, getNotes, removeNote,
+  getConfig, setConfig,
+  getFilterWords, addFilterWord, removeFilterWord,
+  setChatban, getChatban, removeChatban
+};
+
+
+
+================================================================================
+FILE: discord-bot/utils/helpers.js
+================================================================================
+
+const { EmbedBuilder, PermissionFlagsBits } = require('discord.js');
+
+// ── Colour palette ──────────────────────────────────────────────
+const COLORS = {
+  success: 0x57F287,
+  error:   0xED4245,
+  warn:    0xFEE75C,
+  info:    0x5865F2,
+  mod:     0xEB459E,
+  log:     0x23272A
+};
+
+// ── Embed builders ──────────────────────────────────────────────
+function successEmbed(title, description) {
+  return new EmbedBuilder().setColor(COLORS.success).setTitle(`✅ ${title}`).setDescription(description).setTimestamp();
+}
+
+function errorEmbed(title, description) {
+  return new EmbedBuilder().setColor(COLORS.error).setTitle(`❌ ${title}`).setDescription(description).setTimestamp();
+}
+
+function warnEmbed(title, description) {
+  return new EmbedBuilder().setColor(COLORS.warn).setTitle(`⚠️ ${title}`).setDescription(description).setTimestamp();
+}
+
+function infoEmbed(title, description) {
+  return new EmbedBuilder().setColor(COLORS.info).setTitle(`ℹ️ ${title}`).setDescription(description).setTimestamp();
+}
+
+function modEmbed(action, moderator, target, reason, extra = {}) {
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.mod)
+    .setTitle(`🔨 ${action}`)
+    .addFields(
+      { name: 'Target', value: `${target.tag || target} (${target.id || target})`, inline: true },
+      { name: 'Moderator', value: `${moderator.tag || moderator}`, inline: true },
+      { name: 'Reason', value: reason || 'No reason provided' }
     )
-    await review_channel.send(embed=embed, view=view)
+    .setTimestamp();
+  for (const [k, v] of Object.entries(extra)) {
+    embed.addFields({ name: k, value: String(v), inline: true });
+  }
+  return embed;
+}
 
+// ── Resolve a user from mention, ID, or tag ──────────────────────
+async function resolveUser(client, guild, input) {
+  if (!input) return null;
+  // Strip mention formatting
+  const cleaned = input.replace(/[<@!>]/g, '').trim();
+  // Try member first (within guild)
+  try {
+    const member = await guild.members.fetch(cleaned).catch(() => null);
+    if (member) return { user: member.user, member };
+  } catch {}
+  // Try fetching user globally
+  try {
+    const user = await client.users.fetch(cleaned).catch(() => null);
+    if (user) return { user, member: null };
+  } catch {}
+  return null;
+}
 
-async def do_chatban(guild, member, seconds, reason, moderator):
-    expiry_ts = int(datetime.now(timezone.utc).timestamp()) + seconds
-    failed = []
-    for channel in guild.text_channels:
-        try:
-            await channel.set_permissions(member, send_messages=False,
-                                          add_reactions=False,
-                                          create_public_threads=False,
-                                          create_private_threads=False,
-                                          send_messages_in_threads=False,
-                                          reason=f"Chat ban by {moderator} — {reason}")
-        except discord.Forbidden:
-            failed.append(channel.name)
+// ── Permission check helper ──────────────────────────────────────
+function hasModPermission(member) {
+  return member.permissions.has(PermissionFlagsBits.ModerateMembers) ||
+         member.permissions.has(PermissionFlagsBits.BanMembers) ||
+         member.permissions.has(PermissionFlagsBits.KickMembers) ||
+         member.permissions.has(PermissionFlagsBits.Administrator);
+}
 
-    embed = discord.Embed(title="🔇  User Chat Banned", color=0xED4245)
-    embed.add_field(name="User",      value=f"{member.mention} (`{member.id}`)", inline=False)
-    embed.add_field(name="Duration",  value=f"`{seconds}s`", inline=True)
-    embed.add_field(name="Expires",   value=f"<t:{expiry_ts}:R>", inline=True)
-    embed.add_field(name="Reason",    value=reason, inline=False)
-    embed.add_field(name="By",        value=moderator.mention, inline=False)
-    if failed:
-        embed.add_field(name="⚠️ Skipped channels", value=", ".join(failed[:10]), inline=False)
+function hasAdminPermission(member) {
+  return member.permissions.has(PermissionFlagsBits.Administrator) ||
+         member.permissions.has(PermissionFlagsBits.ManageGuild);
+}
 
-    try:
-        await member.send(embed=discord.Embed(
-            title="🔇  You've been chat banned",
-            description=(
-                f"You have been chat banned in **{guild.name}**.\n\n"
-                f"**Reason:** {reason}\n**Expires:** <t:{expiry_ts}:R>"
-            ),
-            color=0xED4245,
-        ))
-    except discord.Forbidden:
-        pass
+// ── Format duration ─────────────────────────────────────────────
+function formatDuration(ms) {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours   = Math.floor(minutes / 60);
+  const days    = Math.floor(hours / 24);
+  if (days > 0)    return `${days}d ${hours % 24}h`;
+  if (hours > 0)   return `${hours}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${seconds}s`;
+}
 
-    duration_str_log = f"{seconds//86400}d" if seconds>=86400 else f"{seconds//3600}h" if seconds>=3600 else f"{seconds//60}m" if seconds>=60 else f"{seconds}s"
-    chatban_log.setdefault(member.id, []).append({"duration": duration_str_log, "reason": reason, "by": str(moderator), "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")})
-    asyncio.create_task(_chatban_expire(guild, member, seconds))
-    asyncio.create_task(send_review_panel(guild, member, seconds, reason, moderator))
-    return embed
+// ── Format timestamp to readable string ─────────────────────────
+function formatDate(date) {
+  return new Date(date).toUTCString();
+}
 
-async def _chatban_expire(guild, member, seconds):
-    await asyncio.sleep(seconds)
-    for channel in guild.text_channels:
-        try:
-            await channel.set_permissions(member, send_messages=None,
-                                          add_reactions=None,
-                                          create_public_threads=None,
-                                          create_private_threads=None,
-                                          send_messages_in_threads=None, reason="Chat ban expired")
-        except discord.Forbidden:
-            pass
-    try:
-        await member.send(embed=success_embed("🔊  Chat Ban Lifted",
-            f"Your chat ban in **{guild.name}** has expired. You can chat again!"))
-    except discord.Forbidden:
-        pass
+// ── Account age warning ─────────────────────────────────────────
+function accountAgeDays(user) {
+  return Math.floor((Date.now() - user.createdTimestamp) / (1000 * 60 * 60 * 24));
+}
 
-# ════════════════════════════════════════════════════════════════════════════════
-# PREFIX COMMANDS  (. prefix)
-# ════════════════════════════════════════════════════════════════════════════════
+// ── Send to log channel ─────────────────────────────────────────
+async function sendLog(guild, embed, db) {
+  const cfg = db.getConfig(guild.id);
+  if (!cfg.logsChannelId) return;
+  const ch = guild.channels.cache.get(cfg.logsChannelId);
+  if (ch) {
+    try { await ch.send({ embeds: [embed] }); } catch {}
+  }
+}
 
-# ── .chatban ──────────────────────────────────────────────────────────────────
-@bot.command(name="chatban")
-@commands.has_permissions(administrator=True)
-async def chatban_prefix(ctx, user: discord.Member, duration: str, *, reason: str = "No reason provided"):
-    seconds = parse_duration(duration)
-    if not seconds:
-        await ctx.reply("⚠️ Invalid duration. Examples: `30s` `10m` `2h` `1d`", delete_after=10); return
-    if user.guild_permissions.administrator:
-        await ctx.reply("⚠️ Can't chat-ban an administrator.", delete_after=10); return
-    embed = await do_chatban(ctx.guild, user, seconds, reason, ctx.author)
-    add_mod_log(user.id, "chatban", reason, str(ctx.author))
-    await ctx.send(embed=embed)
-    await ctx.message.delete()
-
-# ── .unchatban ────────────────────────────────────────────────────────────────
-@bot.command(name="unchatban")
-@commands.has_permissions(administrator=True)
-async def unchatban_prefix(ctx, user: discord.Member):
-    for channel in ctx.guild.text_channels:
-        try:
-            await channel.set_permissions(user, send_messages=None,
-                                          add_reactions=None,
-                                          create_public_threads=None,
-                                          create_private_threads=None,
-                                          send_messages_in_threads=None, reason=f"Unchatban by {ctx.author}")
-        except discord.Forbidden:
-            pass
-    await ctx.send(embed=success_embed("🔊  Chat Ban Removed", f"{user.mention} can chat again."))
-    await ctx.message.delete()
-
-# ── .mute ─────────────────────────────────────────────────────────────────────
-@bot.command(name="mute")
-@commands.has_permissions(moderate_members=True)
-async def mute_prefix(ctx, user: discord.Member, duration: str, *, reason: str = "No reason provided"):
-    seconds = parse_duration(duration)
-    if not seconds:
-        await ctx.reply("⚠️ Invalid duration.", delete_after=10); return
-    if seconds > 2419200:
-        await ctx.reply("⚠️ Max 28 days.", delete_after=10); return
-    until = discord.utils.utcnow() + timedelta(seconds=seconds)
-    await user.timeout(until, reason=f"{ctx.author}: {reason}")
-    add_mod_log(user.id, "mute", reason, str(ctx.author))
-    expiry_ts = int(until.timestamp())
-    embed = discord.Embed(title="🔕  User Muted", color=0xFEE75C)
-    embed.add_field(name="User",    value=user.mention, inline=False)
-    embed.add_field(name="Expires", value=f"<t:{expiry_ts}:R>", inline=True)
-    embed.add_field(name="Reason",  value=reason, inline=False)
-    embed.add_field(name="By",      value=ctx.author.mention, inline=False)
-    await ctx.send(embed=embed)
-    await ctx.message.delete()
-    try:
-        await user.send(embed=discord.Embed(title="🔕  You've been muted",
-            description=f"Muted in **{ctx.guild.name}**\n**Reason:** {reason}\n**Expires:** <t:{expiry_ts}:R>",
-            color=0xFEE75C))
-    except discord.Forbidden:
-        pass
-
-# ── .unmute ───────────────────────────────────────────────────────────────────
-@bot.command(name="unmute")
-@commands.has_permissions(moderate_members=True)
-async def unmute_prefix(ctx, user: discord.Member):
-    await user.timeout(None, reason=f"Unmuted by {ctx.author}")
-    await ctx.send(embed=success_embed("🔔  Unmuted", f"{user.mention} has been unmuted."))
-    await ctx.message.delete()
-
-# ── .kick ─────────────────────────────────────────────────────────────────────
-@bot.command(name="kick")
-@commands.has_permissions(kick_members=True)
-async def kick_prefix(ctx, user: discord.Member, *, reason: str = "No reason provided"):
-    if user.guild_permissions.administrator:
-        await ctx.reply("⚠️ Can't kick an administrator.", delete_after=10); return
-    try:
-        await user.send(embed=discord.Embed(title="👢  Kicked",
-            description=f"Kicked from **{ctx.guild.name}**\n**Reason:** {reason}", color=0xED4245))
-    except discord.Forbidden:
-        pass
-    kick_log.setdefault(user.id, []).append({"reason": reason, "by": str(ctx.author), "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")})
-    await user.kick(reason=f"{ctx.author}: {reason}")
-    add_mod_log(user.id, "kick", reason, str(ctx.author))
-    await ctx.send(embed=discord.Embed(title="👢  User Kicked",
-        description=f"**{user}** kicked.\n**Reason:** {reason}\n**By:** {ctx.author.mention}", color=0xED4245))
-    await ctx.message.delete()
-
-# ── .ban ──────────────────────────────────────────────────────────────────────
-@bot.command(name="ban")
-@commands.has_permissions(ban_members=True)
-async def ban_prefix(ctx, user: discord.Member, *, reason: str = "No reason provided"):
-    if user.guild_permissions.administrator:
-        await ctx.reply("⚠️ Can't ban an administrator.", delete_after=10); return
-    try:
-        await user.send(embed=discord.Embed(title="🔨  Banned",
-            description=f"Banned from **{ctx.guild.name}**\n**Reason:** {reason}", color=0xED4245))
-    except discord.Forbidden:
-        pass
-    ban_log.setdefault(user.id, []).append({"reason": reason, "by": str(ctx.author), "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")})
-    await user.ban(reason=f"{ctx.author}: {reason}")
-    add_mod_log(user.id, "ban", reason, str(ctx.author))
-    embed = discord.Embed(title="🔨  User Banned",
-        description=f"**{user}** banned.\n**Reason:** {reason}\n**By:** {ctx.author.mention}", color=0xED4245)
-    await ctx.send(embed=embed)
-    await ctx.message.delete()
-
-# ── .unban ────────────────────────────────────────────────────────────────────
-@bot.command(name="unban")
-@commands.has_permissions(ban_members=True)
-async def unban_prefix(ctx, user_id: str):
-    try:
-        user = await bot.fetch_user(int(user_id))
-        await ctx.guild.unban(user)
-        await ctx.send(embed=success_embed("✅  Unbanned", f"**{user}** unbanned by {ctx.author.mention}."))
-        await ctx.message.delete()
-    except discord.NotFound:
-        await ctx.reply("⚠️ User not found or not banned.", delete_after=10)
-
-# ── .warn ─────────────────────────────────────────────────────────────────────
-@bot.command(name="warn")
-@commands.has_permissions(manage_messages=True)
-async def warn_prefix(ctx, user: discord.Member, *, reason: str = "No reason provided"):
-    warnings.setdefault(user.id, []).append({
-        "reason": reason, "by": str(ctx.author),
-        "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
-    })
-    count = len(warnings[user.id])
-    embed = discord.Embed(title="⚠️  User Warned", color=0xFEE75C,
-        description=f"**User:** {user.mention}\n**Reason:** {reason}\n**By:** {ctx.author.mention}\n**Total warnings:** {count}")
-    await send_to_logs(ctx.guild, embed)
-    await ctx.send(embed=embed)
-    await ctx.message.delete()
-    try:
-        await user.send(embed=discord.Embed(title="⚠️  Warning Received",
-            description=f"Warned in **{ctx.guild.name}**\n**Reason:** {reason}\n**Total warnings:** {count}",
-            color=0xFEE75C))
-    except discord.Forbidden:
-        pass
-    await apply_warning_escalation(ctx.guild, user, count, ctx.channel)
-
-# ── .warnings ─────────────────────────────────────────────────────────────────
-@bot.command(name="warnings")
-@commands.has_permissions(manage_messages=True)
-async def warnings_prefix(ctx, user: discord.Member):
-    user_warnings = warnings.get(user.id, [])
-    if not user_warnings:
-        await ctx.reply(f"✅ {user.mention} has no warnings.", delete_after=10); return
-    embed = discord.Embed(title=f"⚠️  Warnings for {user}", description=f"Total: **{len(user_warnings)}**", color=0xFEE75C)
-    for i, w in enumerate(user_warnings, 1):
-        embed.add_field(name=f"#{i}", value=f"**Reason:** {w['reason']}\n**By:** {w['by']}\n**At:** {w['at']}", inline=False)
-    await ctx.send(embed=embed)
-
-# ── .clearwarnings ────────────────────────────────────────────────────────────
-@bot.command(name="clearwarnings")
-@commands.has_permissions(administrator=True)
-async def clearwarnings_prefix(ctx, user: discord.Member):
-    warnings.pop(user.id, None)
-    await ctx.send(embed=success_embed("✅  Warnings Cleared", f"All warnings cleared for {user.mention}."))
-    await ctx.message.delete()
-
-# ── .purge ────────────────────────────────────────────────────────────────────
-@bot.command(name="purge")
-@commands.has_permissions(manage_messages=True)
-async def purge_prefix(ctx, amount: int):
-    if not 1 <= amount <= 100:
-        await ctx.reply("⚠️ Between 1 and 100.", delete_after=10); return
-    deleted = await ctx.channel.purge(limit=amount + 1)
-    await ctx.send(embed=success_embed("🗑️  Purged", f"Deleted **{len(deleted)-1}** messages."), delete_after=5)
-
-# ── .slowmode ─────────────────────────────────────────────────────────────────
-@bot.command(name="slowmode")
-@commands.has_permissions(manage_channels=True)
-async def slowmode_prefix(ctx, seconds: int):
-    if not 0 <= seconds <= 21600:
-        await ctx.reply("⚠️ Between 0 and 21600 seconds.", delete_after=10); return
-    await ctx.channel.edit(slowmode_delay=seconds)
-    msg = "Slowmode disabled." if seconds == 0 else f"Slowmode set to **{seconds}s**."
-    await ctx.send(embed=success_embed("✅  Slowmode", msg), delete_after=5)
-    await ctx.message.delete()
-
-# ── .modhelp ──────────────────────────────────────────────────────────────────
-@bot.command(name="modhelp")
-async def modhelp_prefix(ctx):
-    embed = discord.Embed(title="🛡️  Complete Moderation Commands", color=0x5865F2,
-        description="Use `.command` or `?command` or `/command`")
-    embed.add_field(name="General", value="usercheck • reviewpanel • logschannel • note • notes • serverinfo • avatar", inline=False)
-    embed.add_field(name="Warnings", value="warn • warnings • clearwarnings (Auto: 3→1d, 5→1w, 6→1mo)", inline=False)
-    embed.add_field(name="Chat Bans", value="chatban • unchatban (Blocks: msgs, reactions, threads)", inline=False)
-    embed.add_field(name="Mute & Timeout", value="mute • unmute", inline=False)
-    embed.add_field(name="Kicks & Bans", value="kick • ban • unban", inline=False)
-    embed.add_field(name="Channels", value="lock • unlock • lockdown • nuke", inline=False)
-    embed.add_field(name="Users", value="nickname • role", inline=False)
-    embed.add_field(name="Cleanup", value="purge • slowmode • filter", inline=False)
-    embed.add_field(name="Auto Features", value="Auto-spam, Join/Leave logs, Ghost ping, 24/7 Active", inline=False)
-    embed.set_footer(text="Prefix: . or ? • Status: Watching over Sparky AI")
-    await ctx.send(embed=embed)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# SLASH COMMANDS
-# ════════════════════════════════════════════════════════════════════════════════
+module.exports = {
+  COLORS, successEmbed, errorEmbed, warnEmbed, infoEmbed, modEmbed,
+  resolveUser, hasModPermission, hasAdminPermission,
+  formatDuration, formatDate, accountAgeDays, sendLog
+};
 
 
 
-# ── .check ────────────────────────────────────────────────────────────────────
-# In-memory logs for kicks and bans
-kick_log: dict[int, list[dict]] = {}
-ban_log: dict[int, list[dict]] = {}
-chatban_log: dict[int, list[dict]] = {}
+================================================================================
+FILE: discord-bot/utils/registerCommands.js
+================================================================================
 
-@bot.command(name="usercheck")
-@commands.has_permissions(manage_messages=True)
-async def usercheck_prefix(ctx, user: discord.Member):
-    await _send_check(ctx.channel, user, ctx.guild)
+const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+require('dotenv').config();
 
-    embed.add_field(
-        name="📊  Moderation Summary",
-        value=(
-            f"⚠️ **Warnings:** {len(user_warnings)}\n"
-            f"🔇 **Chat Bans:** {len(user_chatbans)}\n"
-            f"👢 **Kicks:** {len(user_kicks)}\n"
-            f"🔨 **Bans:** {len(user_bans)}"
-        ),
-        inline=False,
+const commands = [
+  // Warn
+  new SlashCommandBuilder().setName('warn').setDescription('Warn a user')
+    .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason for the warning')),
+
+  // Warnings
+  new SlashCommandBuilder().setName('warnings').setDescription('View warnings for a user')
+    .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(true)),
+
+  // Delwarn
+  new SlashCommandBuilder().setName('delwarn').setDescription('Delete a warning')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Warning ID').setRequired(true)),
+
+  // Chatban
+  new SlashCommandBuilder().setName('chatban').setDescription('Chatban a user')
+    .addUserOption(o => o.setName('user').setDescription('User to chatban').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason')),
+
+  // Unchatban
+  new SlashCommandBuilder().setName('unchatban').setDescription('Remove a chatban')
+    .addUserOption(o => o.setName('user').setDescription('User to unchatban').setRequired(true)),
+
+  // Mute
+  new SlashCommandBuilder().setName('mute').setDescription('Timeout/mute a user')
+    .addUserOption(o => o.setName('user').setDescription('User to mute').setRequired(true))
+    .addStringOption(o => o.setName('duration').setDescription('Duration (e.g. 10m, 1h, 2d)').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason')),
+
+  // Unmute
+  new SlashCommandBuilder().setName('unmute').setDescription('Remove a timeout from a user')
+    .addUserOption(o => o.setName('user').setDescription('User to unmute').setRequired(true)),
+
+  // Kick
+  new SlashCommandBuilder().setName('kick').setDescription('Kick a member')
+    .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason')),
+
+  // Ban
+  new SlashCommandBuilder().setName('ban').setDescription('Ban a user')
+    .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason')),
+
+  // Unban
+  new SlashCommandBuilder().setName('unban').setDescription('Unban a user by ID')
+    .addStringOption(o => o.setName('reason').setDescription('User ID to unban').setRequired(true)),
+
+  // Usercheck
+  new SlashCommandBuilder().setName('usercheck').setDescription('View user info and mod history')
+    .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(true)),
+
+  // Note
+  new SlashCommandBuilder().setName('note').setDescription('Add a private mod note to a user')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Note text').setRequired(true)),
+
+  // Notes
+  new SlashCommandBuilder().setName('notes').setDescription('View notes for a user')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+
+  // Delnote
+  new SlashCommandBuilder().setName('delnote').setDescription('Delete a note')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Note ID').setRequired(true)),
+
+  // Lock
+  new SlashCommandBuilder().setName('lock').setDescription('Lock the current channel'),
+
+  // Unlock
+  new SlashCommandBuilder().setName('unlock').setDescription('Unlock the current channel'),
+
+  // Lockdown
+  new SlashCommandBuilder().setName('lockdown').setDescription('Lock all channels'),
+
+  // Unlockall
+  new SlashCommandBuilder().setName('unlockall').setDescription('Unlock all channels'),
+
+  // Nuke
+  new SlashCommandBuilder().setName('nuke').setDescription('Clone and delete current channel'),
+
+  // Nickname
+  new SlashCommandBuilder().setName('nickname').setDescription('Force change a user\'s nickname')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('nickname').setDescription('New nickname (leave empty to reset)')),
+
+  // Role
+  new SlashCommandBuilder().setName('role').setDescription('Add or remove a role from a user')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addRoleOption(o => o.setName('role').setDescription('Role to add/remove').setRequired(true)),
+
+  // Purge
+  new SlashCommandBuilder().setName('purge').setDescription('Bulk delete messages')
+    .addIntegerOption(o => o.setName('amount').setDescription('Number of messages (1-100)').setRequired(true).setMinValue(1).setMaxValue(100)),
+
+  // Slowmode
+  new SlashCommandBuilder().setName('slowmode').setDescription('Set channel slowmode')
+    .addIntegerOption(o => o.setName('amount').setDescription('Seconds (0 to disable)').setRequired(true).setMinValue(0).setMaxValue(21600)),
+
+  // Filter
+  new SlashCommandBuilder().setName('filter').setDescription('Manage word filter')
+    .addSubcommand(s => s.setName('add').setDescription('Add a word to filter').addStringOption(o => o.setName('word').setDescription('Word to filter').setRequired(true)))
+    .addSubcommand(s => s.setName('remove').setDescription('Remove a word from filter').addStringOption(o => o.setName('word').setDescription('Word to remove').setRequired(true)))
+    .addSubcommand(s => s.setName('list').setDescription('List all filtered words')),
+
+  // Avatar
+  new SlashCommandBuilder().setName('avatar').setDescription('Show a user\'s avatar')
+    .addUserOption(o => o.setName('user').setDescription('User (defaults to yourself)')),
+
+  // Logschannel
+  new SlashCommandBuilder().setName('logschannel').setDescription('Set the mod logs channel')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel for mod logs').setRequired(true)),
+
+  // Serverinfo
+  new SlashCommandBuilder().setName('serverinfo').setDescription('Show server information'),
+
+  // Review panel
+  new SlashCommandBuilder().setName('reviewpanel').setDescription('Open chatban review panel for a user')
+    .addUserOption(o => o.setName('user').setDescription('User to review').setRequired(true)),
+
+  // Help
+  new SlashCommandBuilder().setName('help').setDescription('Show all commands'),
+].map(c => c.toJSON());
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  const guildId = process.env.GUILD_ID;
+
+  console.log('[DEPLOY] Registering slash commands...');
+  try {
+    if (guildId) {
+      // Guild commands (instant, for development)
+      await rest.put(Routes.applicationGuildCommands(
+        // We grab app ID from a quick auth check
+        (await rest.get(Routes.user('@me'))).id,
+        guildId
+      ), { body: commands });
+      console.log(`[DEPLOY] Registered ${commands.length} guild commands to ${guildId}`);
+    } else {
+      // Global commands (up to 1h to propagate)
+      const appId = (await rest.get(Routes.user('@me'))).id;
+      await rest.put(Routes.applicationCommands(appId), { body: commands });
+      console.log(`[DEPLOY] Registered ${commands.length} global commands`);
+    }
+  } catch (err) {
+    console.error('[DEPLOY] Error registering commands:', err);
+  }
+}
+
+module.exports = { registerCommands };
+
+
+
+================================================================================
+FILE: discord-bot/commands/moderation.js
+================================================================================
+
+const {
+  EmbedBuilder, PermissionFlagsBits, ActionRowBuilder,
+  ButtonBuilder, ButtonStyle, ChannelType
+} = require('discord.js');
+const db = require('../utils/database');
+const {
+  successEmbed, errorEmbed, warnEmbed, infoEmbed, modEmbed,
+  resolveUser, hasModPermission, hasAdminPermission,
+  formatDuration, formatDate, accountAgeDays, sendLog
+} = require('../utils/helpers');
+const { applyChatban, removeChatban } = require('../utils/chatban');
+
+// ═══════════════════════════════════════════════════════════════
+//  COMMAND REGISTRY
+// ═══════════════════════════════════════════════════════════════
+const commands = {};
+
+function cmd(name, aliases, handler) {
+  commands[name] = handler;
+  for (const alias of aliases) commands[alias] = handler;
+}
+
+// ───────────────────────────────────────────────────────────────
+//  WARN
+// ───────────────────────────────────────────────────────────────
+cmd('warn', [], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+
+  const reason = ctx.args.slice(1).join(' ') || 'No reason provided';
+  const { user } = resolved;
+
+  const warnings = db.addWarning(ctx.guild.id, user.id, ctx.member.id, reason);
+  const count = warnings.length;
+
+  db.addModAction(ctx.guild.id, user.id, { type: 'WARN', moderatorId: ctx.member.id, reason });
+
+  // Auto-escalation
+  let escalationMsg = '';
+  if (count === 3) {
+    await applyChatban(ctx.guild, user.id, 'Auto: 3 warnings', ctx.client.user.id, 24 * 60 * 60 * 1000);
+    escalationMsg = '\n⚡ **Auto-escalation:** 1-day chatban applied.';
+  } else if (count === 5) {
+    await applyChatban(ctx.guild, user.id, 'Auto: 5 warnings', ctx.client.user.id, 7 * 24 * 60 * 60 * 1000);
+    escalationMsg = '\n⚡ **Auto-escalation:** 1-week chatban applied.';
+    try {
+      await user.send({
+        embeds: [warnEmbed('Final Warning', `You have received 5 warnings in **${ctx.guild.name}**. Further violations will result in a temporary ban.`)]
+      });
+    } catch {}
+  } else if (count >= 6) {
+    const banExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    try {
+      await ctx.guild.members.ban(user.id, { reason: 'Auto: 6 warnings - 1 month temp ban', deleteMessageSeconds: 0 });
+      db.addModAction(ctx.guild.id, user.id, { type: 'TEMPBAN', moderatorId: ctx.client.user.id, reason: 'Auto: 6 warnings', expiresAt: banExpiry.toISOString() });
+    } catch {}
+    escalationMsg = '\n⚡ **Auto-escalation:** 1-month temporary ban applied.';
+  }
+
+  const embed = modEmbed('Warning Issued', ctx.member.user, user, reason, { 'Warning Count': `${count}` });
+  embed.setDescription((embed.data.description || '') + escalationMsg);
+
+  await sendLog(ctx.guild, embed, db);
+  ctx.reply({ embeds: [embed] });
+
+  // DM the warned user
+  try {
+    await user.send({
+      embeds: [warnEmbed('You were warned', `**Server:** ${ctx.guild.name}\n**Reason:** ${reason}\n**Total Warnings:** ${count}`)]
+    });
+  } catch {}
+});
+
+// ───────────────────────────────────────────────────────────────
+//  WARNINGS (view)
+// ───────────────────────────────────────────────────────────────
+cmd('warnings', ['infractions'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+
+  const warnings = db.getWarnings(ctx.guild.id, resolved.user.id);
+  if (!warnings.length) return ctx.reply({ embeds: [infoEmbed('No Warnings', `${resolved.user.tag} has no warnings.`)] });
+
+  const embed = new EmbedBuilder()
+    .setColor(0xFEE75C)
+    .setTitle(`⚠️ Warnings for ${resolved.user.tag}`)
+    .setThumbnail(resolved.user.displayAvatarURL())
+    .setDescription(warnings.map((w, i) =>
+      `**#${i + 1}** • <t:${Math.floor(new Date(w.timestamp).getTime() / 1000)}:R>\n> ${w.reason}\n> *by <@${w.moderatorId}>* • ID: \`${w.id}\``
+    ).join('\n\n'))
+    .setFooter({ text: `${warnings.length} total warning(s)` })
+    .setTimestamp();
+
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  DELWARN
+// ───────────────────────────────────────────────────────────────
+cmd('delwarn', ['removewarn'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+  const warnId = parseInt(ctx.args[1]);
+  if (!warnId) return ctx.reply({ embeds: [errorEmbed('Invalid ID', 'Provide a warning ID.')] });
+  const removed = db.removeWarning(ctx.guild.id, resolved.user.id, warnId);
+  ctx.reply({ embeds: [removed ? successEmbed('Warning Removed', `Removed warning \`${warnId}\` from ${resolved.user.tag}.`) : errorEmbed('Not Found', 'Warning ID not found.')] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  CHATBAN
+// ───────────────────────────────────────────────────────────────
+cmd('chatban', ['cb'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+
+  const reason = ctx.args.slice(1).join(' ') || 'No reason provided';
+  const { user } = resolved;
+
+  await applyChatban(ctx.guild, user.id, reason, ctx.member.id);
+  db.addModAction(ctx.guild.id, user.id, { type: 'CHATBAN', moderatorId: ctx.member.id, reason });
+
+  const embed = modEmbed('Chatban Applied', ctx.member.user, user, reason);
+  await sendLog(ctx.guild, embed, db);
+  ctx.reply({ embeds: [embed] });
+
+  try {
+    await user.send({ embeds: [errorEmbed('Chatbanned', `You have been chatbanned in **${ctx.guild.name}**.\n**Reason:** ${reason}`)] });
+  } catch {}
+});
+
+// ───────────────────────────────────────────────────────────────
+//  UNCHATBAN
+// ───────────────────────────────────────────────────────────────
+cmd('unchatban', ['uncb'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+
+  const { user } = resolved;
+  await removeChatban(ctx.guild, user.id);
+  db.addModAction(ctx.guild.id, user.id, { type: 'UNCHATBAN', moderatorId: ctx.member.id });
+
+  const embed = modEmbed('Chatban Removed', ctx.member.user, user, 'Chatban lifted');
+  await sendLog(ctx.guild, embed, db);
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  MUTE (timeout)
+// ───────────────────────────────────────────────────────────────
+cmd('mute', ['timeout'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved?.member) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that member.')] });
+
+  // Parse duration: 10m, 1h, 2d etc.
+  const durationStr = ctx.args[1] || '10m';
+  const duration = parseDuration(durationStr);
+  if (!duration) return ctx.reply({ embeds: [errorEmbed('Invalid Duration', 'Use format: 10m, 1h, 2d (max 28d)')] });
+
+  const reason = ctx.args.slice(2).join(' ') || 'No reason provided';
+  const { user, member } = resolved;
+
+  try {
+    await member.timeout(duration, reason);
+  } catch (e) {
+    return ctx.reply({ embeds: [errorEmbed('Failed', `Could not mute: ${e.message}`)] });
+  }
+
+  db.addModAction(ctx.guild.id, user.id, { type: 'MUTE', moderatorId: ctx.member.id, reason, duration: durationStr });
+
+  const embed = modEmbed('Member Muted', ctx.member.user, user, reason, { Duration: durationStr });
+  await sendLog(ctx.guild, embed, db);
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  UNMUTE
+// ───────────────────────────────────────────────────────────────
+cmd('unmute', ['untimeout'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved?.member) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that member.')] });
+
+  const { user, member } = resolved;
+  try {
+    await member.timeout(null, 'Mute removed');
+  } catch (e) {
+    return ctx.reply({ embeds: [errorEmbed('Failed', `Could not unmute: ${e.message}`)] });
+  }
+
+  db.addModAction(ctx.guild.id, user.id, { type: 'UNMUTE', moderatorId: ctx.member.id });
+  const embed = modEmbed('Member Unmuted', ctx.member.user, user, 'Mute removed');
+  await sendLog(ctx.guild, embed, db);
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  KICK
+// ───────────────────────────────────────────────────────────────
+cmd('kick', [], async (ctx) => {
+  if (!ctx.member.permissions.has(PermissionFlagsBits.KickMembers)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Kick Members permission.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved?.member) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that member.')] });
+
+  const reason = ctx.args.slice(1).join(' ') || 'No reason provided';
+  const { user, member } = resolved;
+
+  try {
+    await member.kick(reason);
+  } catch (e) {
+    return ctx.reply({ embeds: [errorEmbed('Failed', `Could not kick: ${e.message}`)] });
+  }
+
+  db.addModAction(ctx.guild.id, user.id, { type: 'KICK', moderatorId: ctx.member.id, reason });
+  const embed = modEmbed('Member Kicked', ctx.member.user, user, reason);
+  await sendLog(ctx.guild, embed, db);
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  BAN
+// ───────────────────────────────────────────────────────────────
+cmd('ban', [], async (ctx) => {
+  if (!ctx.member.permissions.has(PermissionFlagsBits.BanMembers)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Ban Members permission.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+
+  const reason = ctx.args.slice(1).join(' ') || 'No reason provided';
+  const { user } = resolved;
+
+  try {
+    await ctx.guild.members.ban(user.id, { reason, deleteMessageSeconds: 604800 });
+  } catch (e) {
+    return ctx.reply({ embeds: [errorEmbed('Failed', `Could not ban: ${e.message}`)] });
+  }
+
+  db.addModAction(ctx.guild.id, user.id, { type: 'BAN', moderatorId: ctx.member.id, reason });
+  const embed = modEmbed('Member Banned', ctx.member.user, user, reason);
+  await sendLog(ctx.guild, embed, db);
+
+  // Ghost ping owner
+  const cfg = db.getConfig(ctx.guild.id);
+  if (cfg.logsChannelId && process.env.OWNER_ID) {
+    const ch = ctx.guild.channels.cache.get(cfg.logsChannelId);
+    if (ch) {
+      const ping = await ch.send(`<@${process.env.OWNER_ID}>`).catch(() => null);
+      if (ping) ping.delete().catch(() => null);
+    }
+  }
+
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  UNBAN
+// ───────────────────────────────────────────────────────────────
+cmd('unban', [], async (ctx) => {
+  if (!ctx.member.permissions.has(PermissionFlagsBits.BanMembers)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Ban Members permission.')] });
+
+  const userId = ctx.args[0]?.replace(/[<@!>]/g, '');
+  if (!userId) return ctx.reply({ embeds: [errorEmbed('Missing User', 'Provide a user ID to unban.')] });
+
+  const reason = ctx.args.slice(1).join(' ') || 'No reason provided';
+
+  try {
+    const ban = await ctx.guild.bans.fetch(userId).catch(() => null);
+    if (!ban) return ctx.reply({ embeds: [errorEmbed('Not Banned', 'That user is not banned.')] });
+    await ctx.guild.members.unban(userId, reason);
+  } catch (e) {
+    return ctx.reply({ embeds: [errorEmbed('Failed', `Could not unban: ${e.message}`)] });
+  }
+
+  const user = await ctx.client.users.fetch(userId).catch(() => ({ tag: userId, id: userId }));
+  db.addModAction(ctx.guild.id, userId, { type: 'UNBAN', moderatorId: ctx.member.id, reason });
+  const embed = modEmbed('Member Unbanned', ctx.member.user, user, reason);
+  await sendLog(ctx.guild, embed, db);
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  USERCHECK
+// ───────────────────────────────────────────────────────────────
+cmd('usercheck', ['uc', 'check', 'info'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0] || ctx.member.id);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+
+  const { user, member } = resolved;
+  const warnings = db.getWarnings(ctx.guild.id, user.id);
+  const actions = db.getModActions(ctx.guild.id, user.id);
+  const ageDays = accountAgeDays(user);
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`🔍 User Check: ${user.tag}`)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true, size: 256 }))
+    .addFields(
+      { name: '👤 User', value: `${user} (\`${user.id}\`)`, inline: true },
+      { name: '📅 Account Created', value: `<t:${Math.floor(user.createdTimestamp / 1000)}:R>`, inline: true },
+      { name: '📆 Account Age', value: `${ageDays} days ${ageDays < 7 ? '⚠️ NEW' : ''}`, inline: true }
     )
+    .setTimestamp();
 
-    # Warnings detail
-    if user_warnings:
-        val = "\n".join([f"`#{i+1}` {w['reason']} — by {w['by']} ({w['at']})" for i, w in enumerate(user_warnings[-5:])])
-        if len(user_warnings) > 5:
-            val += f"\n*...and {len(user_warnings)-5} more*"
-        embed.add_field(name=f"⚠️  Warnings ({len(user_warnings)})", value=val, inline=False)
+  if (member) {
+    embed.addFields(
+      { name: '📥 Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
+      { name: '🏷️ Roles', value: member.roles.cache.filter(r => r.id !== ctx.guild.id).map(r => r).join(', ') || 'None', inline: false }
+    );
+  }
 
-    # Chat bans detail
-    if user_chatbans:
-        val = "\n".join([f"`#{i+1}` {c['duration']} — {c['reason']} — by {c['by']} ({c['at']})" for i, c in enumerate(user_chatbans[-3:])])
-        embed.add_field(name=f"🔇  Chat Bans ({len(user_chatbans)})", value=val, inline=False)
+  embed.addFields(
+    { name: `⚠️ Warnings (${warnings.length})`, value: warnings.length ? warnings.slice(-3).map(w => `• ${w.reason} — <t:${Math.floor(new Date(w.timestamp).getTime() / 1000)}:R>`).join('\n') : 'None' },
+    { name: `🔨 Recent Actions (${actions.length})`, value: actions.length ? actions.slice(-5).map(a => `• **${a.type}** — ${a.reason || ''} <t:${Math.floor(new Date(a.timestamp).getTime() / 1000)}:R>`).join('\n') : 'None' }
+  );
 
-    # Kicks detail
-    if user_kicks:
-        val = "\n".join([f"`#{i+1}` {k['reason']} — by {k['by']} ({k['at']})" for i, k in enumerate(user_kicks[-3:])])
-        embed.add_field(name=f"👢  Kicks ({len(user_kicks)})", value=val, inline=False)
+  // Possible alts: accounts created within 24h of this one, in the same guild
+  const within24h = ctx.guild.members.cache.filter(m =>
+    m.id !== user.id &&
+    Math.abs(m.user.createdTimestamp - user.createdTimestamp) < 24 * 60 * 60 * 1000
+  );
+  if (within24h.size > 0) {
+    embed.addFields({ name: '🔁 Possible Alts', value: within24h.map(m => `${m.user.tag}`).slice(0, 10).join('\n') });
+  }
 
-    # Bans detail
-    if user_bans:
-        val = "\n".join([f"`#{i+1}` {b['reason']} — by {b['by']} ({b['at']})" for i, b in enumerate(user_bans[-3:])])
-        embed.add_field(name=f"🔨  Bans ({len(user_bans)})", value=val, inline=False)
+  ctx.reply({ embeds: [embed] });
+});
 
-    if not any([user_warnings, user_chatbans, user_kicks, user_bans]):
-        embed.add_field(name="✅  Clean Record", value="No moderation actions on record.", inline=False)
+// ───────────────────────────────────────────────────────────────
+//  NOTE / NOTES
+// ───────────────────────────────────────────────────────────────
+cmd('note', [], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
 
-    embed.set_footer(text=f"Checked by moderator • {now.strftime('%d %b %Y %H:%M UTC')}")
-    await channel.send(embed=embed)
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
 
+  const noteText = ctx.args.slice(1).join(' ');
+  if (!noteText) return ctx.reply({ embeds: [errorEmbed('Missing Note', 'Provide note text after the user.')] });
 
-# ── Mod log store ─────────────────────────────────────────────────────────────
-mod_log: dict[int, list[dict]] = {}
+  const entry = db.addNote(ctx.guild.id, resolved.user.id, ctx.member.id, noteText);
+  ctx.reply({ embeds: [successEmbed('Note Added', `Note added for ${resolved.user.tag}.\n> ${noteText}\nID: \`${entry.id}\``)] });
+});
 
-def add_mod_log(user_id: int, action: str, reason: str, moderator: str):
-    mod_log.setdefault(user_id, []).append({
-        "action": action,
-        "reason": reason,
-        "by": moderator,
-        "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
-    })
+cmd('notes', [], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
 
-# ── .check ────────────────────────────────────────────────────────────────────
-async def send_check_embed(send_fn, member: discord.Member, guild: discord.Guild, **kwargs):
-    user_warnings = warnings.get(member.id, [])
-    user_logs     = mod_log.get(member.id, [])
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
 
-    kicks     = [e for e in user_logs if e["action"] == "kick"]
-    bans      = [e for e in user_logs if e["action"] == "ban"]
-    chatbans  = [e for e in user_logs if e["action"] == "chatban"]
-    mutes     = [e for e in user_logs if e["action"] == "mute"]
+  const notes = db.getNotes(ctx.guild.id, resolved.user.id);
+  if (!notes.length) return ctx.reply({ embeds: [infoEmbed('No Notes', `No notes for ${resolved.user.tag}.`)] });
 
-    # Account age
-    created_at = member.created_at.strftime("%d %b %Y")
-    joined_at  = member.joined_at.strftime("%d %b %Y") if member.joined_at else "Unknown"
-    account_age_days = (datetime.now(timezone.utc) - member.created_at).days
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`📝 Notes for ${resolved.user.tag}`)
+    .setDescription(notes.map((n, i) =>
+      `**#${i + 1}** by <@${n.moderatorId}> • <t:${Math.floor(new Date(n.timestamp).getTime() / 1000)}:R>\n> ${n.note}\n> ID: \`${n.id}\``
+    ).join('\n\n'))
+    .setTimestamp();
 
-    # Alt detection heuristic: account < 30 days old
-    alt_warning = ""
-    if account_age_days < 30:
-        alt_warning = f"\n⚠️ **Possible alt** — account is only **{account_age_days} days old**"
+  ctx.reply({ embeds: [embed] });
+});
 
-    embed = discord.Embed(
-        title=f"🔍  Moderation Profile — {member}",
-        color=0xED4245 if (user_warnings or kicks or bans) else 0x57F287,
+cmd('delnote', [], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+  const noteId = parseInt(ctx.args[1]);
+  if (!noteId) return ctx.reply({ embeds: [errorEmbed('Invalid ID', 'Provide a note ID.')] });
+  const removed = db.removeNote(ctx.guild.id, resolved.user.id, noteId);
+  ctx.reply({ embeds: [removed ? successEmbed('Note Deleted', 'Note removed.') : errorEmbed('Not Found', 'Note ID not found.')] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  LOCK / UNLOCK
+// ───────────────────────────────────────────────────────────────
+cmd('lock', [], async (ctx) => {
+  if (!hasAdminPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Manage Guild permission.')] });
+  const channel = ctx.channel;
+  try {
+    await channel.permissionOverwrites.edit(ctx.guild.roles.everyone, { SendMessages: false });
+    ctx.reply({ embeds: [successEmbed('Channel Locked', `${channel} is now locked.`)] });
+    await sendLog(ctx.guild, modEmbed('Channel Locked', ctx.member.user, { tag: channel.name, id: channel.id }, 'Manual lock'), db);
+  } catch (e) {
+    ctx.reply({ embeds: [errorEmbed('Failed', e.message)] });
+  }
+});
+
+cmd('unlock', [], async (ctx) => {
+  if (!hasAdminPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Manage Guild permission.')] });
+  const channel = ctx.channel;
+  try {
+    await channel.permissionOverwrites.edit(ctx.guild.roles.everyone, { SendMessages: null });
+    ctx.reply({ embeds: [successEmbed('Channel Unlocked', `${channel} is now unlocked.`)] });
+    await sendLog(ctx.guild, modEmbed('Channel Unlocked', ctx.member.user, { tag: channel.name, id: channel.id }, 'Manual unlock'), db);
+  } catch (e) {
+    ctx.reply({ embeds: [errorEmbed('Failed', e.message)] });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────
+//  LOCKDOWN
+// ───────────────────────────────────────────────────────────────
+cmd('lockdown', [], async (ctx) => {
+  if (!hasAdminPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Manage Guild permission.')] });
+
+  const channels = ctx.guild.channels.cache.filter(c => c.isTextBased() && !c.isThread());
+  let count = 0;
+  for (const [, ch] of channels) {
+    try {
+      await ch.permissionOverwrites.edit(ctx.guild.roles.everyone, { SendMessages: false });
+      count++;
+    } catch {}
+  }
+
+  await sendLog(ctx.guild, modEmbed('🔒 SERVER LOCKDOWN', ctx.member.user, { tag: ctx.guild.name, id: ctx.guild.id }, `Locked ${count} channels`), db);
+  ctx.reply({ embeds: [warnEmbed('Lockdown Active', `Locked **${count}** channels. Use \`.unlock\` in each or \`.unlockall\` to lift.`)] });
+});
+
+cmd('unlockall', [], async (ctx) => {
+  if (!hasAdminPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Manage Guild permission.')] });
+
+  const channels = ctx.guild.channels.cache.filter(c => c.isTextBased() && !c.isThread());
+  let count = 0;
+  for (const [, ch] of channels) {
+    try {
+      await ch.permissionOverwrites.edit(ctx.guild.roles.everyone, { SendMessages: null });
+      count++;
+    } catch {}
+  }
+
+  ctx.reply({ embeds: [successEmbed('Lockdown Lifted', `Unlocked **${count}** channels.`)] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  NUKE
+// ───────────────────────────────────────────────────────────────
+cmd('nuke', [], async (ctx) => {
+  if (!hasAdminPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Manage Guild permission.')] });
+
+  const channel = ctx.channel;
+  const pos = channel.position;
+  const parent = channel.parentId;
+  const overwrites = channel.permissionOverwrites.cache;
+  const topic = channel.topic;
+  const name = channel.name;
+
+  try {
+    const newCh = await channel.clone({ name, topic, parent, permissionOverwrites: overwrites, position: pos });
+    await channel.delete('Nuked');
+    await newCh.send({ embeds: [successEmbed('Channel Nuked', '💣 Channel has been nuked and recreated.')] });
+    await sendLog(ctx.guild, modEmbed('Channel Nuked', ctx.member.user, { tag: name, id: channel.id }, 'Nuke command'), db);
+  } catch (e) {
+    ctx.reply({ embeds: [errorEmbed('Failed', e.message)] });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────
+//  NICKNAME
+// ───────────────────────────────────────────────────────────────
+cmd('nickname', ['nick'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved?.member) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that member.')] });
+
+  const newNick = ctx.args.slice(1).join(' ') || null;
+  try {
+    await resolved.member.setNickname(newNick, `Changed by ${ctx.member.user.tag}`);
+    ctx.reply({ embeds: [successEmbed('Nickname Changed', `${resolved.user}'s nickname set to: **${newNick || '(reset)'}**`)] });
+  } catch (e) {
+    ctx.reply({ embeds: [errorEmbed('Failed', e.message)] });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────
+//  ROLE
+// ───────────────────────────────────────────────────────────────
+cmd('role', [], async (ctx) => {
+  if (!hasAdminPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Manage Guild permission.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved?.member) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that member.')] });
+
+  const roleInput = ctx.args[1];
+  if (!roleInput) return ctx.reply({ embeds: [errorEmbed('Missing Role', 'Provide a role mention or ID.')] });
+
+  const roleId = roleInput.replace(/[<@&>]/g, '');
+  const role = ctx.guild.roles.cache.get(roleId);
+  if (!role) return ctx.reply({ embeds: [errorEmbed('Role Not Found', 'Could not find that role.')] });
+
+  const { member } = resolved;
+  try {
+    if (member.roles.cache.has(role.id)) {
+      await member.roles.remove(role);
+      ctx.reply({ embeds: [successEmbed('Role Removed', `Removed ${role} from ${member.user.tag}.`)] });
+    } else {
+      await member.roles.add(role);
+      ctx.reply({ embeds: [successEmbed('Role Added', `Added ${role} to ${member.user.tag}.`)] });
+    }
+  } catch (e) {
+    ctx.reply({ embeds: [errorEmbed('Failed', e.message)] });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────
+//  PURGE
+// ───────────────────────────────────────────────────────────────
+cmd('purge', ['clear', 'prune'], async (ctx) => {
+  if (!ctx.member.permissions.has(PermissionFlagsBits.ManageMessages)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Manage Messages permission.')] });
+
+  const amount = parseInt(ctx.args[0]);
+  if (!amount || amount < 1 || amount > 100) return ctx.reply({ embeds: [errorEmbed('Invalid Amount', 'Provide a number between 1 and 100.')] });
+
+  try {
+    const deleted = await ctx.channel.bulkDelete(amount, true);
+    const msg = await ctx.channel.send({ embeds: [successEmbed('Purge Complete', `Deleted **${deleted.size}** messages.`)] });
+    setTimeout(() => msg.delete().catch(() => null), 4000);
+  } catch (e) {
+    ctx.reply({ embeds: [errorEmbed('Failed', e.message)] });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────
+//  SLOWMODE
+// ───────────────────────────────────────────────────────────────
+cmd('slowmode', ['slow'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const seconds = parseInt(ctx.args[0]);
+  if (isNaN(seconds) || seconds < 0 || seconds > 21600) return ctx.reply({ embeds: [errorEmbed('Invalid', 'Slowmode must be 0–21600 seconds.')] });
+
+  try {
+    await ctx.channel.setRateLimitPerUser(seconds);
+    ctx.reply({ embeds: [successEmbed('Slowmode Set', seconds === 0 ? 'Slowmode disabled.' : `Slowmode set to **${seconds}s**.`)] });
+  } catch (e) {
+    ctx.reply({ embeds: [errorEmbed('Failed', e.message)] });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────
+//  FILTER
+// ───────────────────────────────────────────────────────────────
+cmd('filter', [], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const sub = ctx.args[0]?.toLowerCase();
+  const word = ctx.args[1]?.toLowerCase();
+
+  if (sub === 'add') {
+    if (!word) return ctx.reply({ embeds: [errorEmbed('Missing Word', 'Provide a word to filter.')] });
+    const added = db.addFilterWord(ctx.guild.id, word);
+    return ctx.reply({ embeds: [added ? successEmbed('Word Added', `\`${word}\` added to filter.`) : infoEmbed('Already Filtered', `\`${word}\` is already in the filter.`)] });
+  }
+
+  if (sub === 'remove' || sub === 'del') {
+    if (!word) return ctx.reply({ embeds: [errorEmbed('Missing Word', 'Provide a word to remove.')] });
+    const removed = db.removeFilterWord(ctx.guild.id, word);
+    return ctx.reply({ embeds: [removed ? successEmbed('Word Removed', `\`${word}\` removed from filter.`) : errorEmbed('Not Found', `\`${word}\` is not in the filter.`)] });
+  }
+
+  if (sub === 'list' || !sub) {
+    const words = db.getFilterWords(ctx.guild.id);
+    return ctx.reply({ embeds: [infoEmbed('Filter List', words.length ? `\`${words.join('`, `')}\`` : 'No filtered words.')] });
+  }
+
+  ctx.reply({ embeds: [errorEmbed('Invalid Subcommand', 'Use: `filter add <word>`, `filter remove <word>`, or `filter list`')] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  AVATAR
+// ───────────────────────────────────────────────────────────────
+cmd('avatar', ['av', 'pfp'], async (ctx) => {
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0] || ctx.member.id);
+  const user = resolved?.user || ctx.member.user;
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`🖼️ ${user.tag}'s Avatar`)
+    .setImage(user.displayAvatarURL({ dynamic: true, size: 1024 }))
+    .setDescription(`[PNG](${user.displayAvatarURL({ format: 'png', size: 1024 })}) | [WebP](${user.displayAvatarURL({ format: 'webp', size: 1024 })}) | [JPG](${user.displayAvatarURL({ format: 'jpg', size: 1024 })})`)
+    .setTimestamp();
+
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  LOGSCHANNEL
+// ───────────────────────────────────────────────────────────────
+cmd('logschannel', ['setlogs', 'logs'], async (ctx) => {
+  if (!hasAdminPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need Manage Guild permission.')] });
+
+  const channelInput = ctx.args[0];
+  if (!channelInput) return ctx.reply({ embeds: [errorEmbed('Missing Channel', 'Mention or provide a channel ID.')] });
+
+  const channelId = channelInput.replace(/[<#>]/g, '');
+  const channel = ctx.guild.channels.cache.get(channelId);
+  if (!channel) return ctx.reply({ embeds: [errorEmbed('Channel Not Found', 'Could not find that channel.')] });
+
+  db.setConfig(ctx.guild.id, 'logsChannelId', channel.id);
+  ctx.reply({ embeds: [successEmbed('Logs Channel Set', `All mod logs will be sent to ${channel}.`)] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  SERVERINFO
+// ───────────────────────────────────────────────────────────────
+cmd('serverinfo', ['si', 'server'], async (ctx) => {
+  const guild = ctx.guild;
+  await guild.fetch();
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`📊 ${guild.name}`)
+    .setThumbnail(guild.iconURL({ dynamic: true }))
+    .addFields(
+      { name: '👑 Owner', value: `<@${guild.ownerId}>`, inline: true },
+      { name: '📅 Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true },
+      { name: '👥 Members', value: `${guild.memberCount}`, inline: true },
+      { name: '💬 Channels', value: `${guild.channels.cache.size}`, inline: true },
+      { name: '🎭 Roles', value: `${guild.roles.cache.size}`, inline: true },
+      { name: '🌍 Region', value: guild.preferredLocale || 'Unknown', inline: true },
+      { name: '🔒 Verification', value: guild.verificationLevel.toString(), inline: true },
+      { name: '🆔 Server ID', value: guild.id, inline: true }
     )
-    embed.set_thumbnail(url=member.display_avatar.url)
+    .setTimestamp();
 
-    # ── Account info
-    embed.add_field(
-        name="👤  Account Info",
-        value=(
-            f"**ID:** `{member.id}`\n"
-            f"**Created:** {created_at} ({account_age_days} days ago)\n"
-            f"**Joined:** {joined_at}\n"
-            f"**Roles:** {len(member.roles) - 1}"
-            f"{alt_warning}"
-        ),
-        inline=False,
+  if (guild.description) embed.setDescription(guild.description);
+  if (guild.bannerURL()) embed.setImage(guild.bannerURL({ size: 1024 }));
+
+  ctx.reply({ embeds: [embed] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  CHATBAN REVIEW PANEL
+// ───────────────────────────────────────────────────────────────
+cmd('reviewpanel', ['cbpanel', 'cbr'], async (ctx) => {
+  if (!hasModPermission(ctx.member)) return ctx.reply({ embeds: [errorEmbed('No Permission', 'You need moderation permissions.')] });
+
+  const resolved = await resolveUser(ctx.client, ctx.guild, ctx.args[0]);
+  if (!resolved) return ctx.reply({ embeds: [errorEmbed('User Not Found', 'Could not find that user.')] });
+
+  const { user } = resolved;
+  const chatbanData = db.getChatban(ctx.guild.id, user.id);
+  const warnings = db.getWarnings(ctx.guild.id, user.id);
+
+  const embed = new EmbedBuilder()
+    .setColor(0xEB459E)
+    .setTitle('🔍 Chatban Review Panel')
+    .setThumbnail(user.displayAvatarURL())
+    .addFields(
+      { name: 'User', value: `${user.tag} (\`${user.id}\`)` },
+      { name: 'Status', value: chatbanData ? '🔴 Currently Chatbanned' : '🟢 Not Chatbanned', inline: true },
+      { name: 'Warnings', value: `${warnings.length}`, inline: true },
+      { name: 'Chatban Reason', value: chatbanData?.reason || 'N/A', inline: false },
+      { name: 'Applied', value: chatbanData ? `<t:${Math.floor(new Date(chatbanData.appliedAt).getTime() / 1000)}:R>` : 'N/A', inline: true },
+      { name: 'Expires', value: chatbanData?.expiresAt ? `<t:${Math.floor(new Date(chatbanData.expiresAt).getTime() / 1000)}:R>` : 'Permanent', inline: true }
     )
+    .setTimestamp();
 
-    # ── Summary
-    embed.add_field(
-        name="📊  Moderation Summary",
-        value=(
-            f"⚠️ **Warnings:** {len(user_warnings)}\n"
-            f"🔇 **Chat Bans:** {len(chatbans)}\n"
-            f"🔕 **Mutes:** {len(mutes)}\n"
-            f"👢 **Kicks:** {len(kicks)}\n"
-            f"🔨 **Bans:** {len(bans)}"
-        ),
-        inline=False,
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`cbr_increase_${user.id}`).setLabel('⬆ Increase Ban').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`cbr_decrease_${user.id}`).setLabel('⬇ Decrease Ban').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`cbr_remove_${user.id}`).setLabel('🔓 Remove Ban').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`cbr_keep_${user.id}`).setLabel('✅ Keep As-Is').setStyle(ButtonStyle.Secondary)
+  );
+
+  ctx.reply({ embeds: [embed], components: [row] });
+});
+
+// ───────────────────────────────────────────────────────────────
+//  HELP
+// ───────────────────────────────────────────────────────────────
+cmd('help', ['h', 'commands'], async (ctx) => {
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('📚 Moderation Bot Commands')
+    .setDescription('Prefix: `.` or `?` — All commands also available as `/command`')
+    .addFields(
+      {
+        name: '⚠️ Warnings',
+        value: '`warn <user> [reason]` • `warnings <user>` • `delwarn <user> <id>`'
+      },
+      {
+        name: '🔇 Chat Restrictions',
+        value: '`chatban <user> [reason]` • `unchatban <user>`\n`mute <user> <duration> [reason]` • `unmute <user>`'
+      },
+      {
+        name: '🔨 Moderation',
+        value: '`kick <user> [reason]` • `ban <user> [reason]` • `unban <id> [reason]`'
+      },
+      {
+        name: '🔍 Information',
+        value: '`usercheck <user>` • `avatar [user]` • `serverinfo`\n`note <user> <text>` • `notes <user>` • `delnote <user> <id>`'
+      },
+      {
+        name: '📢 Channel Management',
+        value: '`lock` • `unlock` • `lockdown` • `unlockall` • `nuke`\n`slowmode <seconds>` • `purge <amount>`'
+      },
+      {
+        name: '🛡️ User Management',
+        value: '`nickname <user> [name]` • `role <user> <role>`'
+      },
+      {
+        name: '🚫 Filter',
+        value: '`filter add <word>` • `filter remove <word>` • `filter list`'
+      },
+      {
+        name: '⚙️ Config',
+        value: '`logschannel <#channel>` • `reviewpanel <user>`'
+      }
     )
+    .setFooter({ text: 'Duration format: 10m, 1h, 2d, 1w' })
+    .setTimestamp();
 
-    # ── Warnings detail
-    if user_warnings:
-        warn_text = ""
-        for i, w in enumerate(user_warnings[-5:], 1):
-            warn_text += f"**#{i}** {w['reason']} — by {w['by']} ({w['at']})\n"
-        if len(user_warnings) > 5:
-            warn_text += f"_...and {len(user_warnings) - 5} more_"
-        embed.add_field(name="⚠️  Recent Warnings", value=warn_text, inline=False)
+  ctx.reply({ embeds: [embed] });
+});
 
-    # ── Action history
-    if user_logs:
-        log_text = ""
-        for e in reversed(user_logs[-8:]):
-            icon = {"kick": "👢", "ban": "🔨", "chatban": "🔇", "mute": "🔕"}.get(e["action"], "📋")
-            log_text += f"{icon} **{e['action'].capitalize()}** — {e['reason']} — by {e['by']} ({e['at']})\n"
-        if len(user_logs) > 8:
-            log_text += f"_...and {len(user_logs) - 8} more_"
-        embed.add_field(name="📋  Action History", value=log_text, inline=False)
+// ───────────────────────────────────────────────────────────────
+//  DURATION PARSER
+// ───────────────────────────────────────────────────────────────
+function parseDuration(str) {
+  const match = str.match(/^(\d+)(s|m|h|d|w)$/);
+  if (!match) return null;
+  const num = parseInt(match[1]);
+  const unit = match[2];
+  const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
+  const ms = num * multipliers[unit];
+  if (ms > 28 * 24 * 60 * 60 * 1000) return null; // Discord max timeout = 28d
+  return ms;
+}
 
-    # ── Notes
-    user_notes = mod_notes.get(member.id, [])
-    if user_notes:
-        notes_text = ""
-        for i, n in enumerate(user_notes[-3:], 1):
-            notes_text += f"**{n['note']}** — {n['by']} ({n['at']})\n"
-        if len(user_notes) > 3:
-            notes_text += f"_...and {len(user_notes) - 3} more_"
-        embed.add_field(name="📝  Moderator Notes", value=notes_text, inline=False)
-
-    if not user_warnings and not user_logs:
-        embed.add_field(name="✅  Clean Record", value="No moderation actions on record.", inline=False)
-
-    embed.set_footer(text=f"Requested by a moderator • {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}")
-    await send_fn(embed=embed, **kwargs)
+module.exports = { commands };
 
 
-
-# ── Mod notes store ───────────────────────────────────────────────────────────
-mod_notes: dict[int, list[dict]] = {}
-word_filter: set[str] = set()
-
-# ── .lock / .unlock ───────────────────────────────────────────────────────────
-@bot.command(name="lock")
-@commands.has_permissions(manage_channels=True)
-async def lock_prefix(ctx, channel: discord.TextChannel = None):
-    channel = channel or ctx.channel
-    await channel.set_permissions(ctx.guild.default_role, send_messages=False,
-                                   reason=f"Channel locked by {ctx.author}")
-    await ctx.send(embed=success_embed("🔒  Channel Locked", f"{channel.mention} has been locked."))
-    await ctx.message.delete()
-
-@bot.command(name="unlock")
-@commands.has_permissions(manage_channels=True)
-async def unlock_prefix(ctx, channel: discord.TextChannel = None):
-    channel = channel or ctx.channel
-    await channel.set_permissions(ctx.guild.default_role, send_messages=None,
-                                   reason=f"Channel unlocked by {ctx.author}")
-    await ctx.send(embed=success_embed("🔓  Channel Unlocked", f"{channel.mention} has been unlocked."))
-    await ctx.message.delete()
-
-@bot.command(name="lockdown")
-@commands.has_permissions(administrator=True)
-async def lockdown_prefix(ctx):
-    await ctx.send(embed=discord.Embed(description="🔒  Locking down all channels…", color=0xFEE75C))
-    locked = 0
-    for channel in ctx.guild.text_channels:
-        try:
-            await channel.set_permissions(ctx.guild.default_role, send_messages=False,
-                                          reason=f"Server lockdown by {ctx.author}")
-            locked += 1
-        except discord.Forbidden:
-            pass
-    await ctx.send(embed=success_embed("🔒  Server Lockdown", f"Locked **{locked}** channels."))
-    await ctx.message.delete()
-
-@bot.command(name="nuke")
-@commands.has_permissions(manage_channels=True)
-async def nuke_prefix(ctx, channel: discord.TextChannel = None):
-    channel = channel or ctx.channel
-    position = channel.position
-    new_channel = await channel.clone(reason=f"Channel nuked by {ctx.author}")
-    await new_channel.edit(position=position)
-    await channel.delete(reason=f"Channel nuked by {ctx.author}")
-    embed = success_embed("💥  Channel Nuked", f"This channel was nuked by {ctx.author.mention}.")
-    embed.set_image(url="https://media.giphy.com/media/MDJ9IbxxvDUQM/giphy.gif")
-    await new_channel.send(embed=embed)
-
-@bot.command(name="nickname")
-@commands.has_permissions(manage_nicknames=True)
-async def nickname_prefix(ctx, user: discord.Member, *, nickname: str = None):
-    old_nick = user.display_name
-    await user.edit(nick=nickname, reason=f"Nickname changed by {ctx.author}")
-    new_text = f"`{nickname}`" if nickname else "removed"
-    await ctx.send(embed=success_embed("✏️  Nickname Changed", 
-        f"{user.mention}'s nickname changed from `{old_nick}` to {new_text}."))
-    await ctx.message.delete()
-
-@bot.command(name="role")
-@commands.has_permissions(manage_roles=True)
-async def role_prefix(ctx, user: discord.Member, role: discord.Role):
-    if role in user.roles:
-        await user.remove_roles(role, reason=f"Role removed by {ctx.author}")
-        await ctx.send(embed=success_embed("➖  Role Removed", f"Removed {role.mention} from {user.mention}."))
-    else:
-        await user.add_roles(role, reason=f"Role added by {ctx.author}")
-        await ctx.send(embed=success_embed("➕  Role Added", f"Added {role.mention} to {user.mention}."))
-    await ctx.message.delete()
-
-@bot.command(name="note")
-@commands.has_permissions(manage_messages=True)
-async def note_prefix(ctx, user: discord.Member, *, note: str):
-    mod_notes.setdefault(user.id, []).append({
-        "note": note,
-        "by": str(ctx.author),
-        "at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC"),
-    })
-    await ctx.send(embed=success_embed("📝  Note Added", f"Added a private note for {user.mention}."))
-    await ctx.message.delete()
-
-@bot.command(name="notes")
-@commands.has_permissions(manage_messages=True)
-async def notes_prefix(ctx, user: discord.Member):
-    user_notes = mod_notes.get(user.id, [])
-    if not user_notes:
-        await ctx.reply(f"📝 No notes for {user.mention}.", delete_after=10)
-        return
-    embed = discord.Embed(title=f"📝  Notes for {user}", color=0x5865F2)
-    for i, n in enumerate(user_notes, 1):
-        embed.add_field(name=f"Note #{i}", value=f"{n['note']}\n— {n['by']} ({n['at']})", inline=False)
-    await ctx.send(embed=embed)
-
-@bot.command(name="filter")
-@commands.has_permissions(manage_messages=True)
-async def filter_prefix(ctx, action: str, *, word: str = None):
-    if action.lower() == "add" and word:
-        word_filter.add(word.lower())
-        await ctx.send(embed=success_embed("🚫  Word Added", f"`{word}` added to the filter."))
-    elif action.lower() == "remove" and word:
-        word_filter.discard(word.lower())
-        await ctx.send(embed=success_embed("✅  Word Removed", f"`{word}` removed from the filter."))
-    elif action.lower() == "list":
-        if not word_filter:
-            await ctx.reply("🚫 No filtered words.", delete_after=10)
-        else:
-            await ctx.send(embed=discord.Embed(
-                title="🚫  Filtered Words",
-                description=", ".join(f"`{w}`" for w in sorted(word_filter)),
-                color=0xED4245
-            ))
-    else:
-        await ctx.reply("Usage: `.filter add/remove/list [word]`", delete_after=10)
-    await ctx.message.delete()
-
-@bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
-        await bot.process_commands(message)
-        return
-    
-    # Check word filter
-    if word_filter and any(word in message.content.lower() for word in word_filter):
-        try:
-            await message.delete()
-            await message.channel.send(
-                f"{message.author.mention} your message was deleted (filtered word).",
-                delete_after=5
-            )
-        except discord.Forbidden:
-            pass
-    
-    await bot.process_commands(message)
-
-# ── .avatar ───────────────────────────────────────────────────────────────────
-@bot.command(name="avatar")
-async def avatar_prefix(ctx, user: discord.Member = None):
-    user = user or ctx.author
-    embed = discord.Embed(title=f"{user}'s Avatar", color=0x5865F2)
-    embed.set_image(url=user.display_avatar.url)
-    await ctx.send(embed=embed)
-
-@bot.command(name="antiraid")
-@commands.has_permissions(administrator=True)
-async def antiraid_prefix(ctx, status: str):
-    global antiraid_enabled
-    if status.lower() == "on":
-        antiraid_enabled = True
-        await ctx.send(embed=success_embed("🛡️  Anti-Raid Enabled", "New accounts joining rapidly will be auto-kicked."))
-    elif status.lower() == "off":
-        antiraid_enabled = False
-        await ctx.send(embed=success_embed("🛡️  Anti-Raid Disabled", "Anti-raid protection is now off."))
-    else:
-        await ctx.reply("Usage: `.antiraid on/off`", delete_after=10)
-    await ctx.message.delete()
-
-@bot.event
-@bot.event
-async def on_member_join(member):
-    # Anti-raid: kick accounts < 7 days old
-    if antiraid_enabled:
-        account_age = (datetime.now(timezone.utc) - member.created_at).days
-        if account_age < 7:
-            try:
-                await member.kick(reason="Anti-raid: Account too new")
-            except:
-                pass
-
-
-# ── .logschannel / /logschannel ───────────────────────────────────────────────
-@bot.command(name="logschannel")
-@commands.has_permissions(administrator=True)
-async def logschannel_prefix(ctx, channel: discord.TextChannel):
-    logs_channels[ctx.guild.id] = channel.id
-    await ctx.send(embed=success_embed("📋  Logs Channel Set", f"Logs will now be sent to {channel.mention}."))
-    await ctx.message.delete()
-
-@tree.command(name="logschannel", description="Set the channel for moderation logs and audit activity")
-@app_commands.describe(channel="Channel to send logs to")
-@app_commands.default_permissions(administrator=True)
-async def logschannel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
-    logs_channels[interaction.guild.id] = channel.id
-    await interaction.response.send_message(
-        embed=success_embed("📋  Logs Channel Set", f"Logs will now be sent to {channel.mention}."),
-        ephemeral=True
-    )
-
-async def send_to_logs(guild: discord.Guild, embed: discord.Embed):
-    """Send an embed to the configured logs channel and ghost ping the owner."""
-    channel_id = logs_channels.get(guild.id)
-    if not channel_id:
-        return
-    
-    channel = guild.get_channel(channel_id)
-    if not channel:
-        return
-    
-    try:
-        # Send log with ghost ping (mention that disappears after sending)
-        msg = await channel.send(f"<@{guild.owner_id}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=False))
-        # The ping will show in audit log but won't actually notify the owner
-    except discord.Forbidden:
-        pass
-
-
-
-
-# ── .logschannel / /logschannel ───────────────────────────────────────────────
-
-
-
-
-async def send_mod_log(guild, action_title, user, reason, moderator):
-    """Send mod action to logs channel and ghost ping server owner."""
-    channel_id = logs_channels.get(guild.id)
-    if not channel_id:
-        return
-    
-    channel = guild.get_channel(channel_id)
-    if not channel:
-        return
-    
-    try:
-        embed = discord.Embed(
-            title=action_title,
-            description=f"**User:** {user.mention} ({user.id})\n**Reason:** {reason}\n**By:** {moderator.mention}",
-            color=0xED4245,
-            timestamp=datetime.now(timezone.utc)
-        )
-        # Ghost ping owner (shows in audit log, doesn't notify)
-        await channel.send(f"<@{guild.owner_id}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=False))
-    except Exception:
-        pass
-
-
-# ── .reviewpanel / /reviewpanel ───────────────────────────────────────────────
-@bot.command(name="reviewpanel")
-@commands.has_permissions(administrator=True)
-async def reviewpanel_prefix(ctx, channel: discord.TextChannel):
-    global REVIEW_CHANNEL_ID
-    REVIEW_CHANNEL_ID = channel.id
-    await ctx.send(embed=success_embed(
-        "✅  Review Channel Updated",
-        f"Chat ban review panels will now be sent to {channel.mention}."
-    ))
-    await ctx.message.delete()
-
-@bot.event
-async def on_command_completion(ctx):
-    """Auto-delete command messages after successful execution."""
-    try:
-        if ctx.command and not ctx.command.name in ['modhelp', 'serverinfo', 'avatar']:
-            await ctx.message.delete()
-    except Exception:
-        pass
-
-
-@bot.event  
-async def on_mention(message):
-    """Respond when bot is mentioned."""
-    if message.author.bot or not bot.user.mentioned_in(message):
-        return
-    if message.reference:  # Reply to another message
-        return
-    embed = discord.Embed(
-        title="👋  Hi there!",
-        description=(
-            f"I'm **{bot.user.name}**, your moderation assistant.\n\n"
-            "Type `.modhelp` or `/modhelp` to see all commands!"
-        ),
-        color=0x5865F2
-    )
-    await message.reply(embed=embed, mention_author=False)
-
-
-@bot.event
-@bot.event
-async def on_member_remove(member):
-    """Log member leaves."""
-    channel = member.guild.system_channel
-    if channel:
-        embed = discord.Embed(
-            title="📤  Member Left",
-            description=f"**{member}** left the server.",
-            color=0xED4245
-        )
-        embed.set_footer(text=f"ID: {member.id}")
-        await channel.send(embed=embed)
-
-@bot.event
-async def on_ready():
-    print(f"✅  Logged in as {bot.user} ({bot.user.id})")
-    bot.add_view(ChatbanReviewView(0, 0, 0, "", 0))
-    await tree.sync()
-    print("✅  Slash commands synced")
-    await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="Watching over Sparky AI")
-    )
-
-if __name__ == "__main__":
-    bot.run(TOKEN)
