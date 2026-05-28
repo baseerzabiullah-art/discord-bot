@@ -52,8 +52,8 @@ OR individually:
 - Read/Send Messages, View Channels
 
 Enable these **Privileged Gateway Intents** in the Developer Portal:
-- ✅ Server Members Intent
-- ✅ Message Content Intent
+-  Server Members Intent
+-  Message Content Intent
 
 ### 3. Installation
 ```bash
