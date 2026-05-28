@@ -402,6 +402,39 @@ async def on_message(message: discord.Message):
                 pass
             return
 
+    # Anti-invite: delete message + chatban anyone posting a Discord invite link
+    INVITE_PATTERN = re.compile(r'(discord\.gg/|discord\.com/invite/|discordapp\.com/invite/)\S+', re.IGNORECASE)
+    if INVITE_PATTERN.search(message.content):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await apply_chatban(message.guild, message.author.id, "Auto: posting a Discord invite link", bot.user.id)
+        db_add_mod_action(message.guild.id, message.author.id, {
+            "type": "CHATBAN", "moderatorId": str(bot.user.id), "reason": "Auto: posting a Discord invite link"
+        })
+        embed = mod_embed("Auto Chatban (Invite Link)", bot.user, message.author,
+                          "Posted a Discord server invite link")
+        embed.color = COLORS["error"]
+        await send_log(message.guild, embed)
+        alert = await message.channel.send(embed=error_embed(
+            "Invite Link Detected",
+            f"{message.author.mention} has been chatbanned for posting a Discord invite link. 🔗🚫"
+        ))
+        try:
+            await message.author.send(embed=error_embed(
+                "Chatbanned",
+                f"You have been chatbanned in **{message.guild.name}** for posting a Discord server invite link."
+            ))
+        except Exception:
+            pass
+        await asyncio.sleep(6)
+        try:
+            await alert.delete()
+        except Exception:
+            pass
+        return
+
     # Anti-spam: 6+ messages in 10 seconds → 5min timeout
     now = time.time()
     uid = message.author.id
