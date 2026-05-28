@@ -842,7 +842,8 @@ async def prefix_nuke(ctx):
         new_ch = await channel.clone(name=channel.name, reason="Nuke command")
         await new_ch.edit(position=channel.position)
         await channel.delete(reason="Nuked")
-        await new_ch.send(embed=success_embed("Channel Nuked", "💣 Channel has been nuked and recreated."))
+        await new_ch.send(embed=success_embed("Channel Nuked", "💣 Channel has been nuked and recreated. RIP to every message that didn't make it out alive. Thoughts and prayers. 🕯️"))
+        await new_ch.send("https://tenor.com/view/pocoyo-dance-gif-12315046871291410991")
         await send_log(ctx.guild, mod_embed("Channel Nuked", ctx.author,
                        type("obj", (object,), {"name": channel.name, "id": channel.id})(),
                        "Nuke command"))
@@ -1349,8 +1350,9 @@ async def slash_nuke(interaction: discord.Interaction):
     new_ch = await channel.clone(name=channel.name, reason="Nuke command")
     await new_ch.edit(position=channel.position)
     await channel.delete(reason="Nuked")
-    await new_ch.send(embed=success_embed("Channel Nuked", "💣 Channel has been nuked and recreated."))
-
+    await new_ch.send(embed=success_embed("Channel Nuked", "💣 Channel has been nuked and recreated. RIP to every message that didn't make it out alive. Thoughts and prayers. 🕯️"))
+    await new_ch.send(embed=success_embed("Channel Nuked", "💣 Channel has been nuked and recreated. RIP to every message that didn't make it out alive. Thoughts and prayers. 🕯️"))
+    await new_ch.send("https://tenor.com/view/pocoyo-dance-gif-12315046871291410991")
 @bot.tree.command(name="nickname", description="Force change a user's nickname", guild=guild_obj)
 @app_commands.describe(user="User", nickname="New nickname (leave empty to reset)")
 async def slash_nickname(interaction: discord.Interaction, user: discord.Member, nickname: str = None):
