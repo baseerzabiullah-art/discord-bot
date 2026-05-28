@@ -542,57 +542,20 @@ async def slowmode_prefix(ctx, seconds: int):
 # ── .modhelp ──────────────────────────────────────────────────────────────────
 @bot.command(name="modhelp")
 async def modhelp_prefix(ctx):
-    embed = discord.Embed(title="🛡️  Moderation Commands", color=0x5865F2,
-        description="Use `.command` or `?command` or `/command`. You can **@mention** users or use their ID.")
-    embed.add_field(name="📋  General", value=(
-        "`.usercheck @user` — Full mod history\n"
-        "`.reviewpanel #channel` — Set review channel\n"
-        "`.note @user [text]` — Add private mod note\n"
-        "`.notes @user` — View all notes"
-    ), inline=False)
-    embed.add_field(name="⚠️  Warnings & Bans", value=(
-        "`.warn @user [reason]` — Warn a user\n"
-        "`.warnings @user` — View warnings\n"
-        "`.clearwarnings @user` — Clear warnings\n"
-        "`.chatban @user [time] [reason]` — Remove chat perms\n"
-        "`.unchatban @user` — Lift chat ban"
-    ), inline=False)
-    embed.add_field(name="🔨  Kicks & Bans", value=(
-        "`.kick @user [reason]` — Kick user\n"
-        "`.ban @user [reason]` — Ban user\n"
-        "`.unban [id]` — Unban user"
-    ), inline=False)
-    embed.add_field(name="🔕  Mute & Timeout", value=(
-        "`.mute @user [time] [reason]` — Timeout\n"
-        "`.unmute @user` — Remove timeout"
-    ), inline=False)
-    embed.add_field(name="🔒  Channel Management", value=(
-        "`.lock [#channel]` — Lock channel\n"
-        "`.unlock [#channel]` — Unlock channel\n"
-        "`.lockdown` — Lock all channels\n"
-        "`.nuke [#channel]` — Clone & delete channel"
-    ), inline=False)
-    embed.add_field(name="✏️  User Management", value=(
-        "`.nickname @user [name]` — Change nickname\n"
-        "`.role @user [@role]` — Add/remove role\n"
-        "`.avatar [@user]` — Show avatar"
-    ), inline=False)
-    embed.add_field(name="🧹  Cleanup & Filter", value=(
-        "`.purge [amount]` — Delete messages (max 100)\n"
-        "`.slowmode [seconds]` — Set slowmode\n"
-        "`.filter add/remove/list [word]` — Manage word filter"
-    ), inline=False)
-    embed.add_field(name="ℹ️  Server Info", value=(
-        "`.serverinfo` — Server statistics\n"
-        "`.avatar [@user]` — View user avatar"
-    ), inline=False)
-    embed.add_field(name="📊  Auto Features", value=(
-        "**Auto-spam:** 6 messages in 10s → 5min mute\n"
-        "**Auto-escalation:** 3 warns→1d ban, 5 warns→1w ban, 6 warns→1mo ban\n"
-        "**Join/Leave logs:** New members logged with account age"
-    ), inline=False)
-    embed.set_footer(text="Duration: 30s / 10m / 2h / 1d  •  Prefix: . or ?  •  Watching over Sparky AI")
+    embed = discord.Embed(title="🛡️  Complete Moderation Commands", color=0x5865F2,
+        description="Use `.command` or `?command` or `/command`")
+    embed.add_field(name="General", value="usercheck • reviewpanel • logschannel • note • notes • serverinfo • avatar", inline=False)
+    embed.add_field(name="Warnings", value="warn • warnings • clearwarnings (Auto: 3→1d, 5→1w, 6→1mo)", inline=False)
+    embed.add_field(name="Chat Bans", value="chatban • unchatban (Blocks: msgs, reactions, threads)", inline=False)
+    embed.add_field(name="Mute & Timeout", value="mute • unmute", inline=False)
+    embed.add_field(name="Kicks & Bans", value="kick • ban • unban", inline=False)
+    embed.add_field(name="Channels", value="lock • unlock • lockdown • nuke", inline=False)
+    embed.add_field(name="Users", value="nickname • role", inline=False)
+    embed.add_field(name="Cleanup", value="purge • slowmode • filter", inline=False)
+    embed.add_field(name="Auto Features", value="Auto-spam, Join/Leave logs, Ghost ping, 24/7 Active", inline=False)
+    embed.set_footer(text="Prefix: . or ? • Status: Watching over Sparky AI")
     await ctx.send(embed=embed)
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # SLASH COMMANDS
@@ -957,6 +920,34 @@ async def send_to_logs(guild: discord.Guild, embed: discord.Embed):
         pass
 
 
+
+
+# ── .logschannel / /logschannel ───────────────────────────────────────────────
+
+
+
+
+async def send_mod_log(guild, action_title, user, reason, moderator):
+    """Send mod action to logs channel and ghost ping server owner."""
+    channel_id = logs_channels.get(guild.id)
+    if not channel_id:
+        return
+    
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    
+    try:
+        embed = discord.Embed(
+            title=action_title,
+            description=f"**User:** {user.mention} ({user.id})\n**Reason:** {reason}\n**By:** {moderator.mention}",
+            color=0xED4245,
+            timestamp=datetime.now(timezone.utc)
+        )
+        # Ghost ping owner (shows in audit log, doesn't notify)
+        await channel.send(f"<@{guild.owner_id}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=False))
+    except Exception:
+        pass
 
 
 # ── .reviewpanel / /reviewpanel ───────────────────────────────────────────────
