@@ -1,1519 +1,1207 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import os
-import json
-import re
-import time
-import asyncio
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+import os, json, time, datetime
+from dotenv import load_dotenv
 
-# ── Environment ─────────────────────────────────────────────────
-TOKEN    = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
-OWNER_ID = os.getenv("OWNER_ID")
+load_dotenv()
 
-if not TOKEN:
-    raise RuntimeError("[ERROR] DISCORD_TOKEN is not set. Please check your .env file.")
-
-# ── Intents ──────────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.members         = True
-intents.message_content = True
-intents.moderation      = True
-
-# ── Bot ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════
 PREFIXES = ['.', '?']
-
-def get_prefix(bot, message):
-    for p in PREFIXES:
-        if message.content.startswith(p):
-            return p
-    return '.'
-
-bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
-
-# ── Spam tracking ────────────────────────────────────────────────
-spam_map: dict[int, list[float]] = defaultdict(list)
-
-# ════════════════════════════════════════════════════════════════
-#  DATABASE (JSON)
-# ════════════════════════════════════════════════════════════════
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+WELCOME_GIF = 'https://media.giphy.com/media/xT9IgzoKnwFNmISR8I/giphy.gif'
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 os.makedirs(DATA_DIR, exist_ok=True)
 
-def _load(filename: str) -> dict:
+# ═══════════════════════════════════════════════════════════════
+#  DATABASE
+# ═══════════════════════════════════════════════════════════════
+def _load(filename):
     path = os.path.join(DATA_DIR, filename)
-    if not os.path.exists(path):
-        return {}
+    if not os.path.exists(path): return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        with open(path) as f: return json.load(f)
+    except: return {}
 
-def _save(filename: str, data: dict):
-    path = os.path.join(DATA_DIR, filename)
-    with open(path, "w", encoding="utf-8") as f:
+def _save(filename, data):
+    with open(os.path.join(DATA_DIR, filename), 'w') as f:
         json.dump(data, f, indent=2)
 
-# Warnings
-def db_get_warnings(guild_id, user_id):
-    d = _load("warnings.json")
-    return d.get(str(guild_id), {}).get(str(user_id), [])
+def get_warnings(guild_id, user_id):
+    return _load('warnings.json').get(str(guild_id), {}).get(str(user_id), [])
 
-def db_add_warning(guild_id, user_id, moderator_id, reason):
-    d = _load("warnings.json")
+def add_warning(guild_id, user_id, moderator_id, reason):
+    data = _load('warnings.json')
     gid, uid = str(guild_id), str(user_id)
-    d.setdefault(gid, {}).setdefault(uid, [])
-    entry = {"id": int(time.time() * 1000), "moderatorId": str(moderator_id),
-             "reason": reason, "timestamp": datetime.now(timezone.utc).isoformat()}
-    d[gid][uid].append(entry)
-    _save("warnings.json", d)
-    return d[gid][uid]
+    data.setdefault(gid, {}).setdefault(uid, [])
+    data[gid][uid].append({'id': int(time.time()*1000), 'moderator_id': str(moderator_id), 'reason': reason, 'timestamp': _now()})
+    _save('warnings.json', data)
+    return data[gid][uid]
 
-def db_remove_warning(guild_id, user_id, warning_id):
-    d = _load("warnings.json")
+def remove_warning(guild_id, user_id, warning_id):
+    data = _load('warnings.json')
     gid, uid = str(guild_id), str(user_id)
-    if gid not in d or uid not in d[gid]:
-        return False
-    before = len(d[gid][uid])
-    d[gid][uid] = [w for w in d[gid][uid] if w["id"] != warning_id]
-    _save("warnings.json", d)
-    return len(d[gid][uid]) < before
+    if gid not in data or uid not in data[gid]: return False
+    before = len(data[gid][uid])
+    data[gid][uid] = [w for w in data[gid][uid] if w['id'] != warning_id]
+    _save('warnings.json', data)
+    return len(data[gid][uid]) < before
 
-# Mod actions
-def db_add_mod_action(guild_id, user_id, action: dict):
-    d = _load("modactions.json")
+def get_mod_actions(guild_id, user_id):
+    return _load('modactions.json').get(str(guild_id), {}).get(str(user_id), [])
+
+def add_mod_action(guild_id, user_id, action):
+    data = _load('modactions.json')
     gid, uid = str(guild_id), str(user_id)
-    d.setdefault(gid, {}).setdefault(uid, [])
-    action["timestamp"] = datetime.now(timezone.utc).isoformat()
-    d[gid][uid].append(action)
-    _save("modactions.json", d)
+    data.setdefault(gid, {}).setdefault(uid, [])
+    action['timestamp'] = _now()
+    data[gid][uid].append(action)
+    _save('modactions.json', data)
 
-def db_get_mod_actions(guild_id, user_id):
-    d = _load("modactions.json")
-    return d.get(str(guild_id), {}).get(str(user_id), [])
+def get_notes(guild_id, user_id):
+    return _load('notes.json').get(str(guild_id), {}).get(str(user_id), [])
 
-# Notes
-def db_add_note(guild_id, user_id, moderator_id, note):
-    d = _load("notes.json")
+def add_note(guild_id, user_id, moderator_id, note):
+    data = _load('notes.json')
     gid, uid = str(guild_id), str(user_id)
-    d.setdefault(gid, {}).setdefault(uid, [])
-    entry = {"id": int(time.time() * 1000), "moderatorId": str(moderator_id),
-             "note": note, "timestamp": datetime.now(timezone.utc).isoformat()}
-    d[gid][uid].append(entry)
-    _save("notes.json", d)
+    data.setdefault(gid, {}).setdefault(uid, [])
+    entry = {'id': int(time.time()*1000), 'moderator_id': str(moderator_id), 'note': note, 'timestamp': _now()}
+    data[gid][uid].append(entry)
+    _save('notes.json', data)
     return entry
 
-def db_get_notes(guild_id, user_id):
-    d = _load("notes.json")
-    return d.get(str(guild_id), {}).get(str(user_id), [])
-
-def db_remove_note(guild_id, user_id, note_id):
-    d = _load("notes.json")
+def remove_note(guild_id, user_id, note_id):
+    data = _load('notes.json')
     gid, uid = str(guild_id), str(user_id)
-    if gid not in d or uid not in d[gid]:
-        return False
-    before = len(d[gid][uid])
-    d[gid][uid] = [n for n in d[gid][uid] if n["id"] != note_id]
-    _save("notes.json", d)
-    return len(d[gid][uid]) < before
+    if gid not in data or uid not in data[gid]: return False
+    before = len(data[gid][uid])
+    data[gid][uid] = [n for n in data[gid][uid] if n['id'] != note_id]
+    _save('notes.json', data)
+    return len(data[gid][uid]) < before
 
-# Config
-def db_get_config(guild_id):
-    d = _load("config.json")
-    return d.get(str(guild_id), {})
+def get_config(guild_id):
+    return _load('config.json').get(str(guild_id), {})
 
-def db_set_config(guild_id, key, value):
-    d = _load("config.json")
+def set_config(guild_id, key, value):
+    data = _load('config.json')
+    data.setdefault(str(guild_id), {})[key] = value
+    _save('config.json', data)
+
+def get_filter_words(guild_id):
+    return _load('filter.json').get(str(guild_id), [])
+
+def add_filter_word(guild_id, word):
+    data = _load('filter.json')
     gid = str(guild_id)
-    d.setdefault(gid, {})[key] = value
-    _save("config.json", d)
-
-# Filter words
-def db_get_filter_words(guild_id):
-    d = _load("filter.json")
-    return d.get(str(guild_id), [])
-
-def db_add_filter_word(guild_id, word):
-    d = _load("filter.json")
-    gid = str(guild_id)
-    d.setdefault(gid, [])
-    if word.lower() not in d[gid]:
-        d[gid].append(word.lower())
-        _save("filter.json", d)
+    data.setdefault(gid, [])
+    if word.lower() not in data[gid]:
+        data[gid].append(word.lower())
+        _save('filter.json', data)
         return True
     return False
 
-def db_remove_filter_word(guild_id, word):
-    d = _load("filter.json")
+def remove_filter_word(guild_id, word):
+    data = _load('filter.json')
     gid = str(guild_id)
-    if gid not in d:
-        return False
-    before = len(d[gid])
-    d[gid] = [w for w in d[gid] if w != word.lower()]
-    _save("filter.json", d)
-    return len(d[gid]) < before
+    if gid not in data: return False
+    before = len(data[gid])
+    data[gid] = [w for w in data[gid] if w != word.lower()]
+    _save('filter.json', data)
+    return len(data[gid]) < before
 
-# Chatbans
-def db_set_chatban(guild_id, user_id, data):
-    d = _load("chatbans.json")
+def set_chatban(guild_id, user_id, chatban_data):
+    data = _load('chatbans.json')
+    data.setdefault(str(guild_id), {})[str(user_id)] = chatban_data
+    _save('chatbans.json', data)
+
+def get_chatban(guild_id, user_id):
+    return _load('chatbans.json').get(str(guild_id), {}).get(str(user_id))
+
+def del_chatban(guild_id, user_id):
+    data = _load('chatbans.json')
     gid, uid = str(guild_id), str(user_id)
-    d.setdefault(gid, {})[uid] = data
-    _save("chatbans.json", d)
+    if gid in data and uid in data[gid]:
+        del data[gid][uid]
+        _save('chatbans.json', data)
 
-def db_get_chatban(guild_id, user_id):
-    d = _load("chatbans.json")
-    return d.get(str(guild_id), {}).get(str(user_id), None)
-
-def db_remove_chatban(guild_id, user_id):
-    d = _load("chatbans.json")
-    gid, uid = str(guild_id), str(user_id)
-    if gid in d and uid in d[gid]:
-        del d[gid][uid]
-        _save("chatbans.json", d)
-
-# ════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #  HELPERS
-# ════════════════════════════════════════════════════════════════
-COLORS = {
-    "success": 0x57F287,
-    "error":   0xED4245,
-    "warn":    0xFEE75C,
-    "info":    0x5865F2,
-    "mod":     0xEB459E,
-    "log":     0x23272A,
-}
+# ═══════════════════════════════════════════════════════════════
+def _now():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
-def success_embed(title, description):
-    return discord.Embed(title=f"✅ {title}", description=description,
-                         color=COLORS["success"], timestamp=datetime.now(timezone.utc))
+COLORS = {'success': 0x57F287, 'error': 0xED4245, 'warn': 0xFEE75C, 'info': 0x5865F2, 'mod': 0xEB459E}
 
-def error_embed(title, description):
-    return discord.Embed(title=f"❌ {title}", description=description,
-                         color=COLORS["error"], timestamp=datetime.now(timezone.utc))
+def success_embed(title, desc):
+    return discord.Embed(title=f'✅ {title}', description=desc, color=COLORS['success'])
 
-def warn_embed(title, description):
-    return discord.Embed(title=f"⚠️ {title}", description=description,
-                         color=COLORS["warn"], timestamp=datetime.now(timezone.utc))
+def error_embed(title, desc):
+    return discord.Embed(title=f'❌ {title}', description=desc, color=COLORS['error'])
 
-def info_embed(title, description):
-    return discord.Embed(title=f"ℹ️ {title}", description=description,
-                         color=COLORS["info"], timestamp=datetime.now(timezone.utc))
+def warn_embed(title, desc):
+    return discord.Embed(title=f'⚠️ {title}', description=desc, color=COLORS['warn'])
 
-def mod_embed(action, moderator, target, reason, extra: dict = {}):
-    target_str = f"{getattr(target, 'name', str(target))} (`{getattr(target, 'id', target)}`)"
-    mod_str    = getattr(moderator, 'name', str(moderator))
-    embed = discord.Embed(title=f"🔨 {action}", color=COLORS["mod"],
-                          timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="Target",    value=target_str,             inline=True)
-    embed.add_field(name="Moderator", value=mod_str,                inline=True)
-    embed.add_field(name="Reason",    value=reason or "No reason provided", inline=False)
-    for k, v in extra.items():
-        embed.add_field(name=k, value=str(v), inline=True)
-    return embed
+def info_embed(title, desc):
+    return discord.Embed(title=f'ℹ️ {title}', description=desc, color=COLORS['info'])
 
-def has_mod_permission(member: discord.Member) -> bool:
+def mod_embed(action, moderator, target, reason, extra=None):
+    e = discord.Embed(title=f'🔨 {action}', color=COLORS['mod'], timestamp=discord.utils.utcnow())
+    e.add_field(name='Target', value=f'{target} (`{getattr(target,"id",target)}`)', inline=True)
+    e.add_field(name='Moderator', value=str(moderator), inline=True)
+    e.add_field(name='Reason', value=reason or 'No reason provided', inline=False)
+    if extra:
+        for k, v in extra.items(): e.add_field(name=k, value=str(v), inline=True)
+    return e
+
+def is_mod(member):
     p = member.guild_permissions
     return any([p.moderate_members, p.ban_members, p.kick_members, p.administrator])
 
-def has_admin_permission(member: discord.Member) -> bool:
+def is_admin(member):
     return member.guild_permissions.administrator or member.guild_permissions.manage_guild
 
-def account_age_days(user: discord.User) -> int:
-    return (datetime.now(timezone.utc) - user.created_at).days
+def age_days(user):
+    return (discord.utils.utcnow() - user.created_at).days
 
-async def send_log(guild: discord.Guild, embed: discord.Embed):
-    cfg = db_get_config(guild.id)
-    channel_id = cfg.get("logsChannelId")
-    if not channel_id:
-        return
-    ch = guild.get_channel(int(channel_id))
-    if ch:
+def parse_duration(s):
+    units = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+    if not s or s[-1] not in units: return None
+    try:
+        v = int(s[:-1])
+        secs = v * units[s[-1]]
+        return secs if secs <= 28*86400 else None
+    except: return None
+
+async def send_log(guild, embed):
+    cfg = get_config(guild.id)
+    ch_id = cfg.get('logsChannelId')
+    if ch_id:
+        ch = guild.get_channel(int(ch_id))
+        if ch:
+            try: await ch.send(embed=embed)
+            except: pass
+
+async def do_reply(ctx_or_inter, **kwargs):
+    if isinstance(ctx_or_inter, commands.Context):
+        await ctx_or_inter.reply(**kwargs)
+    else:
+        if ctx_or_inter.response.is_done():
+            await ctx_or_inter.followup.send(**kwargs)
+        else:
+            await ctx_or_inter.response.send_message(**kwargs)
+
+async def apply_chatban(guild, user_id, reason, mod_id, duration_secs=None):
+    member = guild.get_member(int(user_id))
+    if not member: return False
+    for ch in guild.text_channels:
         try:
-            await ch.send(embed=embed)
-        except Exception:
-            pass
-
-def parse_duration(s: str):
-    match = re.match(r'^(\d+)(s|m|h|d|w)$', s)
-    if not match:
-        return None
-    num, unit = int(match.group(1)), match.group(2)
-    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
-    seconds = num * multipliers[unit]
-    if seconds > 28 * 86400:
-        return None
-    return timedelta(seconds=seconds)
-
-async def resolve_user(guild: discord.Guild, raw: str):
-    if not raw:
-        return None, None
-    cleaned = re.sub(r'[<@!>]', '', raw).strip()
-    try:
-        member = guild.get_member(int(cleaned)) or await guild.fetch_member(int(cleaned))
-        if member:
-            return member.user if hasattr(member, 'user') else member._user, member
-    except Exception:
-        pass
-    try:
-        user = await bot.fetch_user(int(cleaned))
-        if user:
-            return user, None
-    except Exception:
-        pass
-    return None, None
-
-# ════════════════════════════════════════════════════════════════
-#  CHATBAN LOGIC
-# ════════════════════════════════════════════════════════════════
-async def apply_chatban(guild: discord.Guild, user_id: int, reason: str,
-                        moderator_id: int, duration_seconds: int = None):
-    try:
-        await guild.fetch_member(user_id)
-    except Exception:
-        return False
-
-    for channel in guild.channels:
-        if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
-            continue
-        try:
-            await channel.set_permissions(
-                discord.Object(id=user_id),
-                send_messages=False,
-                add_reactions=False,
-                create_public_threads=False,
-                create_private_threads=False,
-                send_messages_in_threads=False
-            )
-        except Exception:
-            pass
-
-    expires_at = None
-    if duration_seconds:
-        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).isoformat()
-
-    db_set_chatban(guild.id, user_id, {
-        "moderatorId": str(moderator_id),
-        "reason": reason,
-        "appliedAt": datetime.now(timezone.utc).isoformat(),
-        "expiresAt": expires_at
+            await ch.set_permissions(member, send_messages=False, add_reactions=False,
+                                     create_public_threads=False, create_private_threads=False,
+                                     send_messages_in_threads=False)
+        except: pass
+    set_chatban(guild.id, user_id, {
+        'moderator_id': str(mod_id), 'reason': reason, 'applied_at': _now(),
+        'expires_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + duration_secs)) if duration_secs else None
     })
     return True
 
-async def remove_chatban(guild: discord.Guild, user_id: int):
-    for channel in guild.channels:
-        if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
-            continue
-        try:
-            overwrite = channel.overwrites_for(discord.Object(id=user_id))
-            if overwrite.is_empty():
-                continue
-            await channel.set_permissions(discord.Object(id=user_id), overwrite=None)
-        except Exception:
-            pass
-    db_remove_chatban(guild.id, user_id)
-    return True
+async def remove_chatban(guild, user_id):
+    member = guild.get_member(int(user_id))
+    if member:
+        for ch in guild.text_channels:
+            try:
+                ow = ch.overwrites_for(member)
+                ow.send_messages = None
+                ow.add_reactions = None
+                ow.create_public_threads = None
+                ow.create_private_threads = None
+                ow.send_messages_in_threads = None
+                if ow.is_empty():
+                    await ch.set_permissions(member, overwrite=None)
+                else:
+                    await ch.set_permissions(member, overwrite=ow)
+            except: pass
+    del_chatban(guild.id, user_id)
 
-# ════════════════════════════════════════════════════════════════
-#  EVENTS
-# ════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  BOT SETUP
+# ═══════════════════════════════════════════════════════════════
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.moderation = True
+
+bot = commands.Bot(command_prefix=PREFIXES, intents=intents, help_command=None)
+tree = bot.tree
+spam_map = {}
+
+# ═══════════════════════════════════════════════════════════════
+#  READY
+# ═══════════════════════════════════════════════════════════════
 @bot.event
 async def on_ready():
-    await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="over Sparky AI"),
-        status=discord.Status.online
-    )
-    if GUILD_ID:
-        guild = discord.Object(id=int(GUILD_ID))
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        print(f"[DEPLOY] Slash commands synced to guild {GUILD_ID}")
+    print(f'[READY] Logged in as {bot.user}')
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='over Sparky AI'))
+    guild_id = os.getenv('GUILD_ID')
+    if guild_id:
+        g = discord.Object(id=int(guild_id))
+        tree.copy_global_to(guild=g)
+        await tree.sync(guild=g)
+        print(f'[DEPLOY] Slash commands synced to guild {guild_id}')
     else:
-        await bot.tree.sync()
-        print("[DEPLOY] Slash commands synced globally")
-    print(f"[READY] Logged in as {bot.user} — Bot is fully operational.")
+        await tree.sync()
+        print('[DEPLOY] Global slash commands synced')
+    print('[READY] Bot is fully operational.')
 
-
+# ═══════════════════════════════════════════════════════════════
+#  EVENTS
+# ═══════════════════════════════════════════════════════════════
 @bot.event
-async def on_member_join(member: discord.Member):
-    cfg = db_get_config(member.guild.id)
-    if not cfg.get("logsChannelId"):
-        return
-    ch = member.guild.get_channel(int(cfg["logsChannelId"]))
-    if not ch:
-        return
-    age = account_age_days(member)
-    color = 0xFEE75C if age < 7 else 0x57F287
-    title = f"📥 Member Joined{'  ⚠️ NEW ACCOUNT' if age < 7 else ''}"
-    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="User",          value=f"{member} (`{member.id}`)",                                  inline=True)
-    embed.add_field(name="Account Age",   value=f"{age} days",                                                inline=True)
-    embed.add_field(name="Created",       value=f"<t:{int(member.created_at.timestamp())}:R>",                inline=True)
-    embed.add_field(name="Total Members", value=str(member.guild.member_count),                               inline=True)
-    if age < 7:
-        embed.description = "⚠️ **This account is less than 7 days old!**"
-    await ch.send(embed=embed)
-
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    cfg = db_get_config(member.guild.id)
-    if not cfg.get("logsChannelId"):
-        return
-    ch = member.guild.get_channel(int(cfg["logsChannelId"]))
-    if not ch:
-        return
-    embed = discord.Embed(title="📤 Member Left", color=0xED4245,
-                          timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="User",          value=f"{member} (`{member.id}`)", inline=True)
-    joined = f"<t:{int(member.joined_at.timestamp())}:R>" if member.joined_at else "Unknown"
-    embed.add_field(name="Joined",        value=joined,                      inline=True)
-    embed.add_field(name="Total Members", value=str(member.guild.member_count), inline=True)
-    await ch.send(embed=embed)
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
+async def on_message(message):
+    if message.author.bot or not message.guild: return
 
     # Word filter
-    filter_words = db_get_filter_words(message.guild.id)
-    if filter_words:
-        lower = message.content.lower()
-        if any(w in lower for w in filter_words):
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            warn = await message.channel.send(embed=warn_embed(
-                "Message Filtered",
-                f"{message.author.mention}, your message was removed for containing a banned word."
-            ))
-            await asyncio.sleep(5)
-            try:
-                await warn.delete()
-            except Exception:
-                pass
-            return
-
-    # Anti-invite: delete message + chatban anyone posting a Discord invite link
-    INVITE_PATTERN = re.compile(r'(discord\.gg/|discord\.com/invite/|discordapp\.com/invite/)\S+', re.IGNORECASE)
-    if INVITE_PATTERN.search(message.content):
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        await apply_chatban(message.guild, message.author.id, "Auto: posting a Discord invite link", bot.user.id)
-        db_add_mod_action(message.guild.id, message.author.id, {
-            "type": "CHATBAN", "moderatorId": str(bot.user.id), "reason": "Auto: posting a Discord invite link"
-        })
-        embed = mod_embed("Auto Chatban (Invite Link)", bot.user, message.author,
-                          "Posted a Discord server invite link")
-        embed.color = COLORS["error"]
-        await send_log(message.guild, embed)
-        alert = await message.channel.send(embed=error_embed(
-            "Invite Link Detected",
-            f"{message.author.mention} has been chatbanned for posting a Discord invite link. 🔗🚫"
-        ))
-        try:
-            await message.author.send(embed=error_embed(
-                "Chatbanned",
-                f"You have been chatbanned in **{message.guild.name}** for posting a Discord server invite link."
-            ))
-        except Exception:
-            pass
-        await asyncio.sleep(6)
-        try:
-            await alert.delete()
-        except Exception:
-            pass
+    words = get_filter_words(message.guild.id)
+    if words and any(w in message.content.lower() for w in words):
+        await message.delete()
+        m = await message.channel.send(embed=warn_embed('Message Filtered', f'{message.author.mention}, your message contained a banned word.'))
+        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
+        await m.delete()
         return
 
-    # Anti-spam: 6+ messages in 10 seconds → 5min timeout
+    # Anti-spam
     now = time.time()
     uid = message.author.id
+    spam_map.setdefault(uid, [])
     spam_map[uid] = [t for t in spam_map[uid] if now - t < 10]
     spam_map[uid].append(now)
-
     if len(spam_map[uid]) >= 6:
         spam_map[uid] = []
         member = message.guild.get_member(uid)
         if member and not member.guild_permissions.manage_messages:
             try:
-                await member.timeout(timedelta(minutes=5), reason="Auto: spam detection (6+ messages in 10s)")
-                embed = mod_embed("Auto Mute (Spam)", bot.user, message.author,
-                                  "Spam detection triggered", {"Duration": "5 minutes"})
-                embed.color = COLORS["warn"]
-                await send_log(message.guild, embed)
-                warn = await message.channel.send(embed=warn_embed(
-                    "Spam Detected",
-                    f"{message.author.mention} has been muted for 5 minutes for spamming."
-                ))
-                await asyncio.sleep(6)
-                try:
-                    await warn.delete()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                until = discord.utils.utcnow() + datetime.timedelta(minutes=5)
+                await member.timeout(until, reason='Auto: spam detection')
+                await send_log(message.guild, mod_embed('Auto Mute (Spam)', bot.user, message.author, 'Spam detection', {'Duration': '5 min'}))
+                m = await message.channel.send(embed=warn_embed('Spam Detected', f'{message.author.mention} muted 5 minutes for spamming.'))
+                await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=6))
+                await m.delete()
+            except: pass
         return
 
     await bot.process_commands(message)
 
-# ════════════════════════════════════════════════════════════════
-#  SHARED COMMAND LOGIC (used by both prefix and slash)
-# ════════════════════════════════════════════════════════════════
 
-async def do_warn(guild, moderator, target_raw, reason, reply):
-    user, member = await resolve_user(guild, str(target_raw))
-    if not user:
-        return await reply(embed=error_embed("User Not Found", "Could not find that user."))
+@bot.event
+async def on_member_join(member):
+    cfg = get_config(member.guild.id)
+    days = age_days(member)
 
-    warnings = db_add_warning(guild.id, user.id, moderator.id, reason or "No reason provided")
+    # Mod log
+    log_id = cfg.get('logsChannelId')
+    if log_id:
+        ch = member.guild.get_channel(int(log_id))
+        if ch:
+            e = discord.Embed(
+                title=f'📥 Member Joined{"  ⚠️ NEW ACCOUNT" if days < 7 else ""}',
+                color=0xFEE75C if days < 7 else 0x57F287,
+                timestamp=discord.utils.utcnow()
+            )
+            e.set_thumbnail(url=member.display_avatar.url)
+            e.add_field(name='User', value=f'{member} (`{member.id}`)', inline=True)
+            e.add_field(name='Account Age', value=f'{days} days', inline=True)
+            e.add_field(name='Created', value=discord.utils.format_dt(member.created_at, 'R'), inline=True)
+            e.add_field(name='Members', value=str(member.guild.member_count), inline=True)
+            if days < 7: e.description = '⚠️ **Account less than 7 days old!**'
+            try: await ch.send(embed=e)
+            except: pass
+
+    # Welcome channel — auto-finds #welcome or uses configured override
+    welcome_ch = discord.utils.get(member.guild.text_channels, name='welcome')
+    if not welcome_ch:
+        wid = cfg.get('welcomeChannelId')
+        if wid: welcome_ch = member.guild.get_channel(int(wid))
+    if not welcome_ch: return
+
+    e = discord.Embed(
+        title=f'🎉 Welcome to {member.guild.name}!',
+        description=(
+            f'Hey {member.mention}, we\'re so glad you\'re here!\n\n'
+            '> 📖 Check the rules and get started.\n'
+            '> 💬 Introduce yourself to the community.\n'
+            '> 🎮 Have fun and enjoy your stay!'
+        ),
+        color=0x5865F2,
+        timestamp=discord.utils.utcnow()
+    )
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name='👤 Member', value=str(member), inline=True)
+    e.add_field(name='🔢 Member #', value=str(member.guild.member_count), inline=True)
+    e.add_field(name='📅 Account Age', value=f'{days} days', inline=True)
+    e.set_image(url=WELCOME_GIF)
+    e.set_footer(text=f'You are our {member.guild.member_count}th member! 🥳', icon_url=member.guild.icon.url if member.guild.icon else None)
+    try:
+        await welcome_ch.send(content=f'🎊 Welcome to the server, {member.mention}! We\'ve been expecting you.', embed=e)
+    except: pass
+
+
+@bot.event
+async def on_member_remove(member):
+    cfg = get_config(member.guild.id)
+    log_id = cfg.get('logsChannelId')
+    if not log_id: return
+    ch = member.guild.get_channel(int(log_id))
+    if not ch: return
+    e = discord.Embed(title='📤 Member Left', color=0xED4245, timestamp=discord.utils.utcnow())
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name='User', value=f'{member} (`{member.id}`)', inline=True)
+    e.add_field(name='Members', value=str(member.guild.member_count), inline=True)
+    try: await ch.send(embed=e)
+    except: pass
+
+# ═══════════════════════════════════════════════════════════════
+#  WARN
+# ═══════════════════════════════════════════════════════════════
+async def _warn(ctx_or_inter, target: discord.Member, reason='No reason provided'):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not is_mod(guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    warnings = add_warning(guild.id, target.id, mod.id, reason)
     count = len(warnings)
-    db_add_mod_action(guild.id, user.id, {"type": "WARN", "moderatorId": str(moderator.id), "reason": reason})
-
-    escalation = ""
+    add_mod_action(guild.id, target.id, {'type': 'WARN', 'moderator_id': str(mod.id), 'reason': reason})
+    note = ''
     if count == 3:
-        await apply_chatban(guild, user.id, "Auto: 3 warnings", bot.user.id, 86400)
-        escalation = "\n⚡ **Auto-escalation:** 1-day chatban applied."
+        await apply_chatban(guild, target.id, 'Auto: 3 warnings', bot.user.id, 86400)
+        note = '\n⚡ **Auto-escalation:** 1-day chatban applied.'
     elif count == 5:
-        await apply_chatban(guild, user.id, "Auto: 5 warnings", bot.user.id, 7 * 86400)
-        escalation = "\n⚡ **Auto-escalation:** 1-week chatban applied."
-        try:
-            await user.send(embed=warn_embed("Final Warning",
-                f"You have received 5 warnings in **{guild.name}**. Further violations will result in a temporary ban."))
-        except Exception:
-            pass
+        await apply_chatban(guild, target.id, 'Auto: 5 warnings', bot.user.id, 604800)
+        note = '\n⚡ **Auto-escalation:** 1-week chatban applied.'
+        try: await target.send(embed=warn_embed('Final Warning', f'5 warnings in **{guild.name}**. Next violation = temp ban.'))
+        except: pass
     elif count >= 6:
         try:
-            await guild.ban(user, reason="Auto: 6 warnings - 1 month temp ban", delete_message_seconds=0)
-            db_add_mod_action(guild.id, user.id, {
-                "type": "TEMPBAN", "moderatorId": str(bot.user.id),
-                "reason": "Auto: 6 warnings",
-                "expiresAt": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-            })
-        except Exception:
-            pass
-        escalation = "\n⚡ **Auto-escalation:** 1-month temporary ban applied."
+            await guild.ban(target, reason='Auto: 6 warnings', delete_message_days=0)
+            add_mod_action(guild.id, target.id, {'type': 'TEMPBAN', 'moderator_id': str(bot.user.id), 'reason': 'Auto: 6 warnings'})
+        except: pass
+        note = '\n⚡ **Auto-escalation:** 1-month temporary ban applied.'
+    e = mod_embed('Warning Issued', mod, target, reason, {'Warnings': str(count)})
+    if note: e.description = note
+    await send_log(guild, e)
+    await do_reply(ctx_or_inter, embed=e)
+    try: await target.send(embed=warn_embed('You were warned', f'**Server:** {guild.name}\n**Reason:** {reason}\n**Warnings:** {count}'))
+    except: pass
 
-    embed = mod_embed("Warning Issued", moderator, user, reason or "No reason provided", {"Warning Count": str(count)})
-    if escalation:
-        embed.description = (embed.description or "") + escalation
-    await send_log(guild, embed)
-    await reply(embed=embed)
+@bot.command(name='warn')
+async def warn_cmd(ctx, target: discord.Member = None, *, reason='No reason provided'):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.warn <user> [reason]'))
+    await _warn(ctx, target, reason)
+
+@tree.command(name='warn', description='Warn a user')
+@app_commands.describe(user='User to warn', reason='Reason')
+async def warn_slash(inter: discord.Interaction, user: discord.Member, reason: str = 'No reason provided'):
+    await inter.response.defer()
+    await _warn(inter, user, reason)
+
+# ═══════════════════════════════════════════════════════════════
+#  WARNINGS
+# ═══════════════════════════════════════════════════════════════
+async def _warnings(ctx_or_inter, target: discord.Member):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    ws = get_warnings(ctx_or_inter.guild.id, target.id)
+    if not ws: return await do_reply(ctx_or_inter, embed=info_embed('No Warnings', f'{target} has no warnings.'))
+    lines = []
+    for i, w in enumerate(ws):
+        ts = int(datetime.datetime.fromisoformat(w['timestamp'].replace('Z','+00:00')).timestamp())
+        lines.append(f'**#{i+1}** • <t:{ts}:R>\n> {w["reason"]}\n> by <@{w["moderator_id"]}> • ID: `{w["id"]}`')
+    e = discord.Embed(title=f'⚠️ Warnings for {target}', description='\n\n'.join(lines), color=COLORS['warn'])
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.set_footer(text=f'{len(ws)} total warning(s)')
+    await do_reply(ctx_or_inter, embed=e)
+
+@bot.command(name='warnings', aliases=['infractions'])
+async def warnings_cmd(ctx, target: discord.Member = None):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.warnings <user>'))
+    await _warnings(ctx, target)
+
+@tree.command(name='warnings', description='View warnings for a user')
+@app_commands.describe(user='User to check')
+async def warnings_slash(inter: discord.Interaction, user: discord.Member):
+    await inter.response.defer()
+    await _warnings(inter, user)
+
+# ═══════════════════════════════════════════════════════════════
+#  DELWARN
+# ═══════════════════════════════════════════════════════════════
+async def _delwarn(ctx_or_inter, target: discord.Member, warning_id: int):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    removed = remove_warning(ctx_or_inter.guild.id, target.id, warning_id)
+    await do_reply(ctx_or_inter, embed=success_embed('Warning Removed', f'Removed warning `{warning_id}`.') if removed else error_embed('Not Found', 'Warning ID not found.'))
+
+@bot.command(name='delwarn', aliases=['removewarn'])
+async def delwarn_cmd(ctx, target: discord.Member = None, warning_id: int = None):
+    if not target or not warning_id: return await ctx.reply(embed=error_embed('Usage', '.delwarn <user> <id>'))
+    await _delwarn(ctx, target, warning_id)
+
+@tree.command(name='delwarn', description='Delete a warning')
+@app_commands.describe(user='User', warning_id='Warning ID')
+async def delwarn_slash(inter: discord.Interaction, user: discord.Member, warning_id: int):
+    await inter.response.defer()
+    await _delwarn(inter, user, warning_id)
+
+# ═══════════════════════════════════════════════════════════════
+#  CHATBAN
+# ═══════════════════════════════════════════════════════════════
+async def _chatban(ctx_or_inter, target: discord.Member, reason='No reason provided'):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not is_mod(guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    await apply_chatban(guild, target.id, reason, mod.id)
+    add_mod_action(guild.id, target.id, {'type': 'CHATBAN', 'moderator_id': str(mod.id), 'reason': reason})
+    e = mod_embed('Chatban Applied', mod, target, reason)
+    await send_log(guild, e)
+    await do_reply(ctx_or_inter, embed=e)
+    try: await target.send(embed=error_embed('Chatbanned', f'Chatbanned in **{guild.name}**.\n**Reason:** {reason}'))
+    except: pass
+
+@bot.command(name='chatban', aliases=['cb'])
+async def chatban_cmd(ctx, target: discord.Member = None, *, reason='No reason provided'):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.chatban <user> [reason]'))
+    await _chatban(ctx, target, reason)
+
+@tree.command(name='chatban', description='Chatban a user from all channels')
+@app_commands.describe(user='User to chatban', reason='Reason')
+async def chatban_slash(inter: discord.Interaction, user: discord.Member, reason: str = 'No reason provided'):
+    await inter.response.defer()
+    await _chatban(inter, user, reason)
+
+# ═══════════════════════════════════════════════════════════════
+#  UNCHATBAN
+# ═══════════════════════════════════════════════════════════════
+async def _unchatban(ctx_or_inter, target: discord.Member):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not is_mod(guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    await remove_chatban(guild, target.id)
+    add_mod_action(guild.id, target.id, {'type': 'UNCHATBAN', 'moderator_id': str(mod.id)})
+    e = mod_embed('Chatban Removed', mod, target, 'Chatban lifted')
+    await send_log(guild, e)
+    await do_reply(ctx_or_inter, embed=e)
+
+@bot.command(name='unchatban', aliases=['uncb'])
+async def unchatban_cmd(ctx, target: discord.Member = None):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.unchatban <user>'))
+    await _unchatban(ctx, target)
+
+@tree.command(name='unchatban', description='Remove a chatban')
+@app_commands.describe(user='User to unchatban')
+async def unchatban_slash(inter: discord.Interaction, user: discord.Member):
+    await inter.response.defer()
+    await _unchatban(inter, user)
+
+# ═══════════════════════════════════════════════════════════════
+#  MUTE
+# ═══════════════════════════════════════════════════════════════
+async def _mute(ctx_or_inter, target: discord.Member, duration_str: str, reason='No reason provided'):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not is_mod(guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    secs = parse_duration(duration_str)
+    if not secs: return await do_reply(ctx_or_inter, embed=error_embed('Invalid Duration', 'Use: 10m, 1h, 2d, 1w (max 28d)'))
     try:
-        await user.send(embed=warn_embed("You were warned",
-            f"**Server:** {guild.name}\n**Reason:** {reason}\n**Total Warnings:** {count}"))
-    except Exception:
-        pass
+        await target.timeout(discord.utils.utcnow() + datetime.timedelta(seconds=secs), reason=reason)
+    except Exception as ex:
+        return await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+    add_mod_action(guild.id, target.id, {'type': 'MUTE', 'moderator_id': str(mod.id), 'reason': reason, 'duration': duration_str})
+    e = mod_embed('Member Muted', mod, target, reason, {'Duration': duration_str})
+    await send_log(guild, e)
+    await do_reply(ctx_or_inter, embed=e)
 
+@bot.command(name='mute', aliases=['timeout'])
+async def mute_cmd(ctx, target: discord.Member = None, duration: str = '10m', *, reason='No reason provided'):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.mute <user> <duration> [reason]'))
+    await _mute(ctx, target, duration, reason)
 
-async def do_mute(guild, moderator, target_raw, duration_str, reason, reply):
-    user, member = await resolve_user(guild, str(target_raw))
-    if not member:
-        return await reply(embed=error_embed("User Not Found", "Could not find that member."))
-    td = parse_duration(duration_str)
-    if not td:
-        return await reply(embed=error_embed("Invalid Duration", "Use format: 10m, 1h, 2d (max 28d)"))
-    try:
-        await member.timeout(td, reason=reason or "No reason provided")
-    except Exception as e:
-        return await reply(embed=error_embed("Failed", str(e)))
-    db_add_mod_action(guild.id, user.id, {"type": "MUTE", "moderatorId": str(moderator.id),
-                                           "reason": reason, "duration": duration_str})
-    embed = mod_embed("Member Muted", moderator, user, reason or "No reason provided", {"Duration": duration_str})
-    await send_log(guild, embed)
-    await reply(embed=embed)
+@tree.command(name='mute', description='Timeout/mute a user')
+@app_commands.describe(user='User to mute', duration='Duration (10m, 1h, 2d)', reason='Reason')
+async def mute_slash(inter: discord.Interaction, user: discord.Member, duration: str, reason: str = 'No reason provided'):
+    await inter.response.defer()
+    await _mute(inter, user, duration, reason)
 
+# ═══════════════════════════════════════════════════════════════
+#  UNMUTE
+# ═══════════════════════════════════════════════════════════════
+async def _unmute(ctx_or_inter, target: discord.Member):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    try: await target.timeout(None, reason='Mute removed')
+    except Exception as ex: return await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+    add_mod_action(ctx_or_inter.guild.id, target.id, {'type': 'UNMUTE', 'moderator_id': str(mod.id)})
+    e = mod_embed('Member Unmuted', mod, target, 'Mute removed')
+    await send_log(ctx_or_inter.guild, e)
+    await do_reply(ctx_or_inter, embed=e)
 
-async def do_kick(guild, moderator, target_raw, reason, reply):
-    user, member = await resolve_user(guild, str(target_raw))
-    if not member:
-        return await reply(embed=error_embed("User Not Found", "Could not find that member."))
-    try:
-        await member.kick(reason=reason or "No reason provided")
-    except Exception as e:
-        return await reply(embed=error_embed("Failed", str(e)))
-    db_add_mod_action(guild.id, user.id, {"type": "KICK", "moderatorId": str(moderator.id), "reason": reason})
-    embed = mod_embed("Member Kicked", moderator, user, reason or "No reason provided")
-    await send_log(guild, embed)
-    await reply(embed=embed)
+@bot.command(name='unmute', aliases=['untimeout'])
+async def unmute_cmd(ctx, target: discord.Member = None):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.unmute <user>'))
+    await _unmute(ctx, target)
 
+@tree.command(name='unmute', description='Remove a timeout')
+@app_commands.describe(user='User to unmute')
+async def unmute_slash(inter: discord.Interaction, user: discord.Member):
+    await inter.response.defer()
+    await _unmute(inter, user)
 
-async def do_ban(guild, moderator, target_raw, reason, reply):
-    user, _ = await resolve_user(guild, str(target_raw))
-    if not user:
-        return await reply(embed=error_embed("User Not Found", "Could not find that user."))
-    try:
-        await guild.ban(user, reason=reason or "No reason provided", delete_message_seconds=604800)
-    except Exception as e:
-        return await reply(embed=error_embed("Failed", str(e)))
-    db_add_mod_action(guild.id, user.id, {"type": "BAN", "moderatorId": str(moderator.id), "reason": reason})
-    embed = mod_embed("Member Banned", moderator, user, reason or "No reason provided")
-    await send_log(guild, embed)
-    cfg = db_get_config(guild.id)
-    if cfg.get("logsChannelId") and OWNER_ID:
-        ch = guild.get_channel(int(cfg["logsChannelId"]))
+# ═══════════════════════════════════════════════════════════════
+#  KICK
+# ═══════════════════════════════════════════════════════════════
+async def _kick(ctx_or_inter, target: discord.Member, reason='No reason provided'):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not guild.get_member(mod.id).guild_permissions.kick_members:
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Kick Members permission.'))
+    try: await target.kick(reason=reason)
+    except Exception as ex: return await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+    add_mod_action(guild.id, target.id, {'type': 'KICK', 'moderator_id': str(mod.id), 'reason': reason})
+    e = mod_embed('Member Kicked', mod, target, reason)
+    await send_log(guild, e)
+    await do_reply(ctx_or_inter, embed=e)
+
+@bot.command(name='kick')
+async def kick_cmd(ctx, target: discord.Member = None, *, reason='No reason provided'):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.kick <user> [reason]'))
+    await _kick(ctx, target, reason)
+
+@tree.command(name='kick', description='Kick a member')
+@app_commands.describe(user='User to kick', reason='Reason')
+async def kick_slash(inter: discord.Interaction, user: discord.Member, reason: str = 'No reason provided'):
+    await inter.response.defer()
+    await _kick(inter, user, reason)
+
+# ═══════════════════════════════════════════════════════════════
+#  BAN
+# ═══════════════════════════════════════════════════════════════
+async def _ban(ctx_or_inter, target: discord.Member, reason='No reason provided'):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not guild.get_member(mod.id).guild_permissions.ban_members:
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Ban Members permission.'))
+    try: await guild.ban(target, reason=reason, delete_message_days=7)
+    except Exception as ex: return await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+    add_mod_action(guild.id, target.id, {'type': 'BAN', 'moderator_id': str(mod.id), 'reason': reason})
+    e = mod_embed('Member Banned', mod, target, reason)
+    await send_log(guild, e)
+    cfg = get_config(guild.id)
+    owner_id = os.getenv('OWNER_ID')
+    if cfg.get('logsChannelId') and owner_id:
+        ch = guild.get_channel(int(cfg['logsChannelId']))
         if ch:
             try:
-                ping = await ch.send(f"<@{OWNER_ID}>")
+                ping = await ch.send(f'<@{owner_id}>')
                 await ping.delete()
-            except Exception:
-                pass
-    await reply(embed=embed)
+            except: pass
+    await do_reply(ctx_or_inter, embed=e)
 
-# ════════════════════════════════════════════════════════════════
-#  PREFIX COMMANDS
-# ════════════════════════════════════════════════════════════════
+@bot.command(name='ban')
+async def ban_cmd(ctx, target: discord.Member = None, *, reason='No reason provided'):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.ban <user> [reason]'))
+    await _ban(ctx, target, reason)
 
-def mod_check():
-    async def predicate(ctx):
-        if not has_mod_permission(ctx.author):
-            await ctx.reply(embed=error_embed("No Permission", "You need moderation permissions."))
-            return False
-        return True
-    return commands.check(predicate)
+@tree.command(name='ban', description='Ban a user')
+@app_commands.describe(user='User to ban', reason='Reason')
+async def ban_slash(inter: discord.Interaction, user: discord.Member, reason: str = 'No reason provided'):
+    await inter.response.defer()
+    await _ban(inter, user, reason)
 
-def admin_check():
-    async def predicate(ctx):
-        if not has_admin_permission(ctx.author):
-            await ctx.reply(embed=error_embed("No Permission", "You need Manage Guild permission."))
-            return False
-        return True
-    return commands.check(predicate)
-
-# ── WARN ────────────────────────────────────────────────────────
-@bot.command(name="warn")
-@mod_check()
-async def prefix_warn(ctx, target=None, *, reason="No reason provided"):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    await do_warn(ctx.guild, ctx.author, target, reason, ctx.reply)
-
-# ── WARNINGS ────────────────────────────────────────────────────
-@bot.command(name="warnings", aliases=["infractions"])
-@mod_check()
-async def prefix_warnings(ctx, target=None):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    user, _ = await resolve_user(ctx.guild, target)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
-    warns = db_get_warnings(ctx.guild.id, user.id)
-    if not warns:
-        return await ctx.reply(embed=info_embed("No Warnings", f"{user} has no warnings."))
-    desc = "\n\n".join(
-        f"**#{i+1}** • <t:{int(datetime.fromisoformat(w['timestamp']).timestamp())}:R>\n> {w['reason']}\n> *by <@{w['moderatorId']}>* • ID: `{w['id']}`"
-        for i, w in enumerate(warns)
-    )
-    embed = discord.Embed(title=f"⚠️ Warnings for {user}", description=desc,
-                          color=COLORS["warn"], timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.set_footer(text=f"{len(warns)} total warning(s)")
-    await ctx.reply(embed=embed)
-
-# ── DELWARN ─────────────────────────────────────────────────────
-@bot.command(name="delwarn", aliases=["removewarn"])
-@mod_check()
-async def prefix_delwarn(ctx, target=None, warn_id=None):
-    if not target or not warn_id:
-        return await ctx.reply(embed=error_embed("Usage", "`.delwarn <user> <id>`"))
-    user, _ = await resolve_user(ctx.guild, target)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
+# ═══════════════════════════════════════════════════════════════
+#  UNBAN
+# ═══════════════════════════════════════════════════════════════
+async def _unban(ctx_or_inter, user_id: int, reason='No reason provided'):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not guild.get_member(mod.id).guild_permissions.ban_members:
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Ban Members permission.'))
     try:
-        wid = int(warn_id)
-    except ValueError:
-        return await ctx.reply(embed=error_embed("Invalid ID", "Provide a valid warning ID."))
-    removed = db_remove_warning(ctx.guild.id, user.id, wid)
-    await ctx.reply(embed=success_embed("Warning Removed", f"Removed warning `{wid}` from {user}.") if removed
-                    else error_embed("Not Found", "Warning ID not found."))
+        user = await bot.fetch_user(user_id)
+        await guild.unban(user, reason=reason)
+    except Exception as ex: return await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+    add_mod_action(guild.id, user_id, {'type': 'UNBAN', 'moderator_id': str(mod.id), 'reason': reason})
+    e = mod_embed('Member Unbanned', mod, user, reason)
+    await send_log(guild, e)
+    await do_reply(ctx_or_inter, embed=e)
 
-# ── CHATBAN ─────────────────────────────────────────────────────
-@bot.command(name="chatban", aliases=["cb"])
-@mod_check()
-async def prefix_chatban(ctx, target=None, *, reason="No reason provided"):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    user, _ = await resolve_user(ctx.guild, target)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
-    await apply_chatban(ctx.guild, user.id, reason, ctx.author.id)
-    db_add_mod_action(ctx.guild.id, user.id, {"type": "CHATBAN", "moderatorId": str(ctx.author.id), "reason": reason})
-    embed = mod_embed("Chatban Applied", ctx.author, user, reason)
-    await send_log(ctx.guild, embed)
-    await ctx.reply(embed=embed)
+@bot.command(name='unban')
+async def unban_cmd(ctx, user_id: int = None, *, reason='No reason provided'):
+    if not user_id: return await ctx.reply(embed=error_embed('Usage', '.unban <user_id> [reason]'))
+    await _unban(ctx, user_id, reason)
+
+@tree.command(name='unban', description='Unban a user by ID')
+@app_commands.describe(user_id='User ID to unban', reason='Reason')
+async def unban_slash(inter: discord.Interaction, user_id: str, reason: str = 'No reason provided'):
+    await inter.response.defer()
+    try: await _unban(inter, int(user_id), reason)
+    except: await do_reply(inter, embed=error_embed('Invalid ID', 'Provide a valid user ID.'))
+
+# ═══════════════════════════════════════════════════════════════
+#  USERCHECK
+# ═══════════════════════════════════════════════════════════════
+async def _usercheck(ctx_or_inter, target: discord.Member):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not is_mod(guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    ws = get_warnings(guild.id, target.id)
+    acts = get_mod_actions(guild.id, target.id)
+    days = age_days(target)
+    e = discord.Embed(title=f'🔍 User Check: {target}', color=COLORS['info'], timestamp=discord.utils.utcnow())
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.add_field(name='👤 User', value=f'{target.mention} (`{target.id}`)', inline=True)
+    e.add_field(name='📅 Created', value=discord.utils.format_dt(target.created_at, 'R'), inline=True)
+    e.add_field(name='📆 Age', value=f'{days} days {"⚠️" if days < 7 else ""}', inline=True)
+    e.add_field(name='📥 Joined', value=discord.utils.format_dt(target.joined_at, 'R') if target.joined_at else 'Unknown', inline=True)
+    roles = [r.mention for r in target.roles if r.name != '@everyone']
+    e.add_field(name='🏷️ Roles', value=' '.join(roles) if roles else 'None', inline=False)
+    warn_lines = '\n'.join([f'• {w["reason"]}' for w in ws[-3:]]) or 'None'
+    e.add_field(name=f'⚠️ Warnings ({len(ws)})', value=warn_lines, inline=False)
+    act_lines = '\n'.join([f'• **{a["type"]}** — {a.get("reason","")[:40]}' for a in acts[-5:]]) or 'None'
+    e.add_field(name=f'🔨 Actions ({len(acts)})', value=act_lines, inline=False)
+    alts = [m for m in guild.members if m.id != target.id and abs((m.created_at - target.created_at).total_seconds()) < 86400]
+    if alts: e.add_field(name='🔁 Possible Alts', value='\n'.join(str(a) for a in alts[:10]), inline=False)
+    await do_reply(ctx_or_inter, embed=e)
+
+@bot.command(name='usercheck', aliases=['uc', 'check'])
+async def usercheck_cmd(ctx, target: discord.Member = None):
+    await _usercheck(ctx, target or ctx.author)
+
+@tree.command(name='usercheck', description='View user info and mod history')
+@app_commands.describe(user='User to check')
+async def usercheck_slash(inter: discord.Interaction, user: discord.Member):
+    await inter.response.defer()
+    await _usercheck(inter, user)
+
+# ═══════════════════════════════════════════════════════════════
+#  NOTE / NOTES / DELNOTE
+# ═══════════════════════════════════════════════════════════════
+async def _note(ctx_or_inter, target: discord.Member, text: str):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    entry = add_note(ctx_or_inter.guild.id, target.id, mod.id, text)
+    await do_reply(ctx_or_inter, embed=success_embed('Note Added', f'Added note for {target}.\n> {text}\nID: `{entry["id"]}`'))
+
+async def _notes(ctx_or_inter, target: discord.Member):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    notes = get_notes(ctx_or_inter.guild.id, target.id)
+    if not notes: return await do_reply(ctx_or_inter, embed=info_embed('No Notes', f'No notes for {target}.'))
+    lines = [f'**#{i+1}** by <@{n["moderator_id"]}>\n> {n["note"]}\n> ID: `{n["id"]}`' for i, n in enumerate(notes)]
+    e = discord.Embed(title=f'📝 Notes for {target}', description='\n\n'.join(lines), color=COLORS['info'])
+    await do_reply(ctx_or_inter, embed=e)
+
+@bot.command(name='note')
+async def note_cmd(ctx, target: discord.Member = None, *, text=None):
+    if not target or not text: return await ctx.reply(embed=error_embed('Usage', '.note <user> <text>'))
+    await _note(ctx, target, text)
+
+@tree.command(name='note', description='Add a private mod note')
+@app_commands.describe(user='User', text='Note text')
+async def note_slash(inter: discord.Interaction, user: discord.Member, text: str):
+    await inter.response.defer()
+    await _note(inter, user, text)
+
+@bot.command(name='notes')
+async def notes_cmd(ctx, target: discord.Member = None):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.notes <user>'))
+    await _notes(ctx, target)
+
+@tree.command(name='notes', description='View notes for a user')
+@app_commands.describe(user='User')
+async def notes_slash(inter: discord.Interaction, user: discord.Member):
+    await inter.response.defer()
+    await _notes(inter, user)
+
+@bot.command(name='delnote')
+async def delnote_cmd(ctx, target: discord.Member = None, note_id: int = None):
+    if not is_mod(ctx.author): return await ctx.reply(embed=error_embed('No Permission', 'You need moderation permissions.'))
+    if not target or not note_id: return await ctx.reply(embed=error_embed('Usage', '.delnote <user> <id>'))
+    removed = remove_note(ctx.guild.id, target.id, note_id)
+    await ctx.reply(embed=success_embed('Note Deleted', 'Removed.') if removed else error_embed('Not Found', 'Note ID not found.'))
+
+@tree.command(name='delnote', description='Delete a note')
+@app_commands.describe(user='User', note_id='Note ID')
+async def delnote_slash(inter: discord.Interaction, user: discord.Member, note_id: int):
+    await inter.response.defer()
+    if not is_mod(inter.guild.get_member(inter.user.id)):
+        return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    removed = remove_note(inter.guild.id, user.id, note_id)
+    await do_reply(inter, embed=success_embed('Note Deleted', 'Removed.') if removed else error_embed('Not Found', 'Note ID not found.'))
+
+# ═══════════════════════════════════════════════════════════════
+#  LOCK / UNLOCK
+# ═══════════════════════════════════════════════════════════════
+async def _lock(ctx_or_inter):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    ch = ctx_or_inter.channel
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
     try:
-        await user.send(embed=error_embed("Chatbanned", f"You have been chatbanned in **{ctx.guild.name}**.\n**Reason:** {reason}"))
-    except Exception:
-        pass
+        await ch.set_permissions(ctx_or_inter.guild.default_role, send_messages=False)
+        await do_reply(ctx_or_inter, embed=success_embed('Channel Locked', f'{ch.mention} is now locked.'))
+        await send_log(ctx_or_inter.guild, mod_embed('Channel Locked', mod, ch, 'Manual lock'))
+    except Exception as ex:
+        await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
 
-# ── UNCHATBAN ───────────────────────────────────────────────────
-@bot.command(name="unchatban", aliases=["uncb"])
-@mod_check()
-async def prefix_unchatban(ctx, target=None):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    user, _ = await resolve_user(ctx.guild, target)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
-    await remove_chatban(ctx.guild, user.id)
-    db_add_mod_action(ctx.guild.id, user.id, {"type": "UNCHATBAN", "moderatorId": str(ctx.author.id)})
-    embed = mod_embed("Chatban Removed", ctx.author, user, "Chatban lifted")
-    await send_log(ctx.guild, embed)
-    await ctx.reply(embed=embed)
-
-# ── MUTE ────────────────────────────────────────────────────────
-@bot.command(name="mute", aliases=["timeout"])
-@mod_check()
-async def prefix_mute(ctx, target=None, duration_str="10m", *, reason="No reason provided"):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    await do_mute(ctx.guild, ctx.author, target, duration_str, reason, ctx.reply)
-
-# ── UNMUTE ──────────────────────────────────────────────────────
-@bot.command(name="unmute", aliases=["untimeout"])
-@mod_check()
-async def prefix_unmute(ctx, target=None):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    user, member = await resolve_user(ctx.guild, target)
-    if not member:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that member."))
+async def _unlock(ctx_or_inter):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    ch = ctx_or_inter.channel
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
     try:
-        await member.timeout(None, reason="Mute removed")
-    except Exception as e:
-        return await ctx.reply(embed=error_embed("Failed", str(e)))
-    db_add_mod_action(ctx.guild.id, user.id, {"type": "UNMUTE", "moderatorId": str(ctx.author.id)})
-    embed = mod_embed("Member Unmuted", ctx.author, user, "Mute removed")
-    await send_log(ctx.guild, embed)
-    await ctx.reply(embed=embed)
+        await ch.set_permissions(ctx_or_inter.guild.default_role, send_messages=None)
+        await do_reply(ctx_or_inter, embed=success_embed('Channel Unlocked', f'{ch.mention} is now unlocked.'))
+        await send_log(ctx_or_inter.guild, mod_embed('Channel Unlocked', mod, ch, 'Manual unlock'))
+    except Exception as ex:
+        await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
 
-# ── KICK ────────────────────────────────────────────────────────
-@bot.command(name="kick")
-async def prefix_kick(ctx, target=None, *, reason="No reason provided"):
-    if not ctx.author.guild_permissions.kick_members:
-        return await ctx.reply(embed=error_embed("No Permission", "You need Kick Members permission."))
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    await do_kick(ctx.guild, ctx.author, target, reason, ctx.reply)
+@bot.command(name='lock')
+async def lock_cmd(ctx): await _lock(ctx)
 
-# ── BAN ─────────────────────────────────────────────────────────
-@bot.command(name="ban")
-async def prefix_ban(ctx, target=None, *, reason="No reason provided"):
-    if not ctx.author.guild_permissions.ban_members:
-        return await ctx.reply(embed=error_embed("No Permission", "You need Ban Members permission."))
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    await do_ban(ctx.guild, ctx.author, target, reason, ctx.reply)
+@bot.command(name='unlock')
+async def unlock_cmd(ctx): await _unlock(ctx)
 
-# ── UNBAN ───────────────────────────────────────────────────────
-@bot.command(name="unban")
-async def prefix_unban(ctx, user_id=None, *, reason="No reason provided"):
-    if not ctx.author.guild_permissions.ban_members:
-        return await ctx.reply(embed=error_embed("No Permission", "You need Ban Members permission."))
-    if not user_id:
-        return await ctx.reply(embed=error_embed("Missing ID", "Provide a user ID."))
-    cleaned = re.sub(r'[<@!>]', '', user_id).strip()
-    try:
-        ban_entry = await ctx.guild.fetch_ban(discord.Object(id=int(cleaned)))
-    except discord.NotFound:
-        return await ctx.reply(embed=error_embed("Not Banned", "That user is not banned."))
-    await ctx.guild.unban(ban_entry.user, reason=reason)
-    db_add_mod_action(ctx.guild.id, ban_entry.user.id, {"type": "UNBAN", "moderatorId": str(ctx.author.id), "reason": reason})
-    embed = mod_embed("Member Unbanned", ctx.author, ban_entry.user, reason)
-    await send_log(ctx.guild, embed)
-    await ctx.reply(embed=embed)
+@tree.command(name='lock', description='Lock the current channel')
+async def lock_slash(inter: discord.Interaction):
+    await inter.response.defer()
+    await _lock(inter)
 
-# ── USERCHECK ───────────────────────────────────────────────────
-@bot.command(name="usercheck", aliases=["uc", "check", "info"])
-@mod_check()
-async def prefix_usercheck(ctx, target=None):
-    raw = target or str(ctx.author.id)
-    user, member = await resolve_user(ctx.guild, raw)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
-    warns   = db_get_warnings(ctx.guild.id, user.id)
-    actions = db_get_mod_actions(ctx.guild.id, user.id)
-    age     = account_age_days(user)
-    embed = discord.Embed(title=f"🔍 User Check: {user}", color=COLORS["info"],
-                          timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="👤 User",            value=f"{user.mention} (`{user.id}`)",                      inline=True)
-    embed.add_field(name="📅 Account Created", value=f"<t:{int(user.created_at.timestamp())}:R>",          inline=True)
-    embed.add_field(name="📆 Account Age",     value=f"{age} days {'⚠️ NEW' if age < 7 else ''}",         inline=True)
-    if member:
-        embed.add_field(name="📥 Joined Server", value=f"<t:{int(member.joined_at.timestamp())}:R>",       inline=True)
-        roles = [r.mention for r in member.roles if r.id != ctx.guild.id]
-        embed.add_field(name="🏷️ Roles", value=", ".join(roles) or "None", inline=False)
-    warn_val = "\n".join(
-        f"• {w['reason']} — <t:{int(datetime.fromisoformat(w['timestamp']).timestamp())}:R>"
-        for w in warns[-3:]
-    ) if warns else "None"
-    embed.add_field(name=f"⚠️ Warnings ({len(warns)})", value=warn_val, inline=False)
-    action_val = "\n".join(
-        f"• **{a['type']}** — {a.get('reason','')} <t:{int(datetime.fromisoformat(a['timestamp']).timestamp())}:R>"
-        for a in actions[-5:]
-    ) if actions else "None"
-    embed.add_field(name=f"🔨 Recent Actions ({len(actions)})", value=action_val, inline=False)
-    alts = [m for m in ctx.guild.members
-            if m.id != user.id and abs((m.created_at - user.created_at).total_seconds()) < 86400]
-    if alts:
-        embed.add_field(name="🔁 Possible Alts", value="\n".join(str(m) for m in alts[:10]), inline=False)
-    await ctx.reply(embed=embed)
+@tree.command(name='unlock', description='Unlock the current channel')
+async def unlock_slash(inter: discord.Interaction):
+    await inter.response.defer()
+    await _unlock(inter)
 
-# ── NOTE / NOTES / DELNOTE ──────────────────────────────────────
-@bot.command(name="note")
-@mod_check()
-async def prefix_note(ctx, target=None, *, text=None):
-    if not target or not text:
-        return await ctx.reply(embed=error_embed("Usage", "`.note <user> <text>`"))
-    user, _ = await resolve_user(ctx.guild, target)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
-    entry = db_add_note(ctx.guild.id, user.id, ctx.author.id, text)
-    await ctx.reply(embed=success_embed("Note Added", f"Note added for {user}.\n> {text}\nID: `{entry['id']}`"))
-
-@bot.command(name="notes")
-@mod_check()
-async def prefix_notes(ctx, target=None):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    user, _ = await resolve_user(ctx.guild, target)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
-    notes = db_get_notes(ctx.guild.id, user.id)
-    if not notes:
-        return await ctx.reply(embed=info_embed("No Notes", f"No notes for {user}."))
-    desc = "\n\n".join(
-        f"**#{i+1}** by <@{n['moderatorId']}> • <t:{int(datetime.fromisoformat(n['timestamp']).timestamp())}:R>\n> {n['note']}\n> ID: `{n['id']}`"
-        for i, n in enumerate(notes)
-    )
-    embed = discord.Embed(title=f"📝 Notes for {user}", description=desc,
-                          color=COLORS["info"], timestamp=datetime.now(timezone.utc))
-    await ctx.reply(embed=embed)
-
-@bot.command(name="delnote")
-@mod_check()
-async def prefix_delnote(ctx, target=None, note_id=None):
-    if not target or not note_id:
-        return await ctx.reply(embed=error_embed("Usage", "`.delnote <user> <id>`"))
-    user, _ = await resolve_user(ctx.guild, target)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
-    try:
-        nid = int(note_id)
-    except ValueError:
-        return await ctx.reply(embed=error_embed("Invalid ID", "Provide a valid note ID."))
-    removed = db_remove_note(ctx.guild.id, user.id, nid)
-    await ctx.reply(embed=success_embed("Note Deleted", "Note removed.") if removed
-                    else error_embed("Not Found", "Note ID not found."))
-
-# ── LOCK / UNLOCK ───────────────────────────────────────────────
-@bot.command(name="lock")
-@admin_check()
-async def prefix_lock(ctx):
-    try:
-        await ctx.channel.set_permissions(ctx.guild.default_role, send_messages=False)
-        await ctx.reply(embed=success_embed("Channel Locked", f"{ctx.channel.mention} is now locked."))
-        await send_log(ctx.guild, mod_embed("Channel Locked", ctx.author,
-                       type("obj", (object,), {"name": ctx.channel.name, "id": ctx.channel.id})(),
-                       "Manual lock"))
-    except Exception as e:
-        await ctx.reply(embed=error_embed("Failed", str(e)))
-
-@bot.command(name="unlock")
-@admin_check()
-async def prefix_unlock(ctx):
-    try:
-        await ctx.channel.set_permissions(ctx.guild.default_role, send_messages=None)
-        await ctx.reply(embed=success_embed("Channel Unlocked", f"{ctx.channel.mention} is now unlocked."))
-    except Exception as e:
-        await ctx.reply(embed=error_embed("Failed", str(e)))
-
-# ── LOCKDOWN / UNLOCKALL ─────────────────────────────────────────
-@bot.command(name="lockdown")
-@admin_check()
-async def prefix_lockdown(ctx):
+# ═══════════════════════════════════════════════════════════════
+#  LOCKDOWN / UNLOCKALL
+# ═══════════════════════════════════════════════════════════════
+async def _lockdown(ctx_or_inter):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not is_admin(guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
     count = 0
-    for ch in ctx.guild.text_channels:
+    for ch in guild.text_channels:
         try:
-            await ch.set_permissions(ctx.guild.default_role, send_messages=False)
+            await ch.set_permissions(guild.default_role, send_messages=False)
             count += 1
-        except Exception:
-            pass
-    await send_log(ctx.guild, mod_embed("🔒 SERVER LOCKDOWN", ctx.author,
-                   type("obj", (object,), {"name": ctx.guild.name, "id": ctx.guild.id})(),
-                   f"Locked {count} channels"))
-    await ctx.reply(embed=warn_embed("Lockdown Active", f"Locked **{count}** channels."))
+        except: pass
+    await send_log(guild, mod_embed('🔒 SERVER LOCKDOWN', mod, guild, f'Locked {count} channels'))
+    await do_reply(ctx_or_inter, embed=warn_embed('Lockdown Active', f'Locked **{count}** channels.'))
 
-@bot.command(name="unlockall")
-@admin_check()
-async def prefix_unlockall(ctx):
+async def _unlockall(ctx_or_inter):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not is_admin(guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
     count = 0
-    for ch in ctx.guild.text_channels:
+    for ch in guild.text_channels:
         try:
-            await ch.set_permissions(ctx.guild.default_role, send_messages=None)
+            await ch.set_permissions(guild.default_role, send_messages=None)
             count += 1
-        except Exception:
-            pass
-    await ctx.reply(embed=success_embed("Lockdown Lifted", f"Unlocked **{count}** channels."))
+        except: pass
+    await do_reply(ctx_or_inter, embed=success_embed('Lockdown Lifted', f'Unlocked **{count}** channels.'))
 
-# ── NUKE ─────────────────────────────────────────────────────────
-@bot.command(name="nuke")
-@admin_check()
-async def prefix_nuke(ctx):
-    channel = ctx.channel
-    try:
-        new_ch = await channel.clone(name=channel.name, reason="Nuke command")
-        await new_ch.edit(position=channel.position)
-        await channel.delete(reason="Nuked")
-        await new_ch.send(embed=success_embed("Channel Nuked", "💣 Channel has been nuked and recreated. RIP to every message that didn't make it out alive. Thoughts and prayers. 🕯️"))
-        await new_ch.send("https://tenor.com/view/pocoyo-dance-gif-12315046871291410991")
-        await send_log(ctx.guild, mod_embed("Channel Nuked", ctx.author,
-                       type("obj", (object,), {"name": channel.name, "id": channel.id})(),
-                       "Nuke command"))
-    except Exception as e:
-        await ctx.reply(embed=error_embed("Failed", str(e)))
+@bot.command(name='lockdown')
+async def lockdown_cmd(ctx): await _lockdown(ctx)
 
-# ── NICKNAME ─────────────────────────────────────────────────────
-@bot.command(name="nickname", aliases=["nick"])
-@mod_check()
-async def prefix_nickname(ctx, target=None, *, new_nick=None):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    user, member = await resolve_user(ctx.guild, target)
-    if not member:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that member."))
-    try:
-        await member.edit(nick=new_nick, reason=f"Changed by {ctx.author}")
-        await ctx.reply(embed=success_embed("Nickname Changed",
-            f"{user.mention}'s nickname set to: **{new_nick or '(reset)'}**"))
-    except Exception as e:
-        await ctx.reply(embed=error_embed("Failed", str(e)))
+@bot.command(name='unlockall')
+async def unlockall_cmd(ctx): await _unlockall(ctx)
 
-# ── ROLE ─────────────────────────────────────────────────────────
-@bot.command(name="role")
-@admin_check()
-async def prefix_role(ctx, target=None, role_input=None):
-    if not target or not role_input:
-        return await ctx.reply(embed=error_embed("Usage", "`.role <user> <role>`"))
-    user, member = await resolve_user(ctx.guild, target)
-    if not member:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that member."))
-    role_id = re.sub(r'[<@&>]', '', role_input).strip()
-    role = ctx.guild.get_role(int(role_id)) if role_id.isdigit() else discord.utils.get(ctx.guild.roles, name=role_input)
-    if not role:
-        return await ctx.reply(embed=error_embed("Role Not Found", "Could not find that role."))
+@tree.command(name='lockdown', description='Lock all channels')
+async def lockdown_slash(inter: discord.Interaction):
+    await inter.response.defer()
+    await _lockdown(inter)
+
+@tree.command(name='unlockall', description='Unlock all channels')
+async def unlockall_slash(inter: discord.Interaction):
+    await inter.response.defer()
+    await _unlockall(inter)
+
+# ═══════════════════════════════════════════════════════════════
+#  NUKE
+# ═══════════════════════════════════════════════════════════════
+async def _nuke(ctx_or_inter):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    ch = ctx_or_inter.channel
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
     try:
-        if role in member.roles:
-            await member.remove_roles(role)
-            await ctx.reply(embed=success_embed("Role Removed", f"Removed {role.mention} from {user}."))
+        new_ch = await ch.clone(reason=f'Nuked by {mod}')
+        await new_ch.edit(position=ch.position)
+        await ch.delete(reason=f'Nuked by {mod}')
+        await new_ch.send(embed=success_embed('Channel Nuked', '💣 Channel has been nuked and recreated.'))
+        await send_log(ctx_or_inter.guild, mod_embed('Channel Nuked', mod, ch, 'Nuke command'))
+    except Exception as ex:
+        await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+
+@bot.command(name='nuke')
+async def nuke_cmd(ctx): await _nuke(ctx)
+
+@tree.command(name='nuke', description='Clone and delete current channel')
+async def nuke_slash(inter: discord.Interaction):
+    await inter.response.defer()
+    await _nuke(inter)
+
+# ═══════════════════════════════════════════════════════════════
+#  NICKNAME
+# ═══════════════════════════════════════════════════════════════
+async def _nickname(ctx_or_inter, target: discord.Member, new_nick=None):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    try:
+        await target.edit(nick=new_nick)
+        await do_reply(ctx_or_inter, embed=success_embed('Nickname Changed', f'{target.mention} nickname set to: **{new_nick or "(reset)"}**'))
+    except Exception as ex:
+        await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+
+@bot.command(name='nickname', aliases=['nick'])
+async def nickname_cmd(ctx, target: discord.Member = None, *, new_nick=None):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.nickname <user> [new name]'))
+    await _nickname(ctx, target, new_nick)
+
+@tree.command(name='nickname', description="Force change a user's nickname")
+@app_commands.describe(user='User', nickname='New nickname (leave blank to reset)')
+async def nickname_slash(inter: discord.Interaction, user: discord.Member, nickname: str = None):
+    await inter.response.defer()
+    await _nickname(inter, user, nickname)
+
+# ═══════════════════════════════════════════════════════════════
+#  ROLE
+# ═══════════════════════════════════════════════════════════════
+async def _role(ctx_or_inter, target: discord.Member, role: discord.Role):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
+    try:
+        if role in target.roles:
+            await target.remove_roles(role)
+            await do_reply(ctx_or_inter, embed=success_embed('Role Removed', f'Removed {role.mention} from {target.mention}.'))
         else:
-            await member.add_roles(role)
-            await ctx.reply(embed=success_embed("Role Added", f"Added {role.mention} to {user}."))
-    except Exception as e:
-        await ctx.reply(embed=error_embed("Failed", str(e)))
+            await target.add_roles(role)
+            await do_reply(ctx_or_inter, embed=success_embed('Role Added', f'Added {role.mention} to {target.mention}.'))
+    except Exception as ex:
+        await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
 
-# ── PURGE ─────────────────────────────────────────────────────────
-@bot.command(name="purge", aliases=["clear", "prune"])
-async def prefix_purge(ctx, amount=None):
-    if not ctx.author.guild_permissions.manage_messages:
-        return await ctx.reply(embed=error_embed("No Permission", "You need Manage Messages permission."))
-    try:
-        n = int(amount)
-        assert 1 <= n <= 100
-    except Exception:
-        return await ctx.reply(embed=error_embed("Invalid Amount", "Provide a number between 1 and 100."))
-    try:
-        deleted = await ctx.channel.purge(limit=n)
-        msg = await ctx.channel.send(embed=success_embed("Purge Complete", f"Deleted **{len(deleted)}** messages."))
-        await asyncio.sleep(4)
-        await msg.delete()
-    except Exception as e:
-        await ctx.reply(embed=error_embed("Failed", str(e)))
+@bot.command(name='role')
+async def role_cmd(ctx, target: discord.Member = None, role: discord.Role = None):
+    if not target or not role: return await ctx.reply(embed=error_embed('Usage', '.role <user> <role>'))
+    await _role(ctx, target, role)
 
-# ── SLOWMODE ──────────────────────────────────────────────────────
-@bot.command(name="slowmode", aliases=["slow"])
-@mod_check()
-async def prefix_slowmode(ctx, seconds=None):
-    try:
-        s = int(seconds)
-        assert 0 <= s <= 21600
-    except Exception:
-        return await ctx.reply(embed=error_embed("Invalid", "Slowmode must be 0–21600 seconds."))
-    try:
-        await ctx.channel.edit(slowmode_delay=s)
-        await ctx.reply(embed=success_embed("Slowmode Set",
-            "Slowmode disabled." if s == 0 else f"Slowmode set to **{s}s**."))
-    except Exception as e:
-        await ctx.reply(embed=error_embed("Failed", str(e)))
+@tree.command(name='role', description='Add or remove a role from a user')
+@app_commands.describe(user='User', role='Role to add/remove')
+async def role_slash(inter: discord.Interaction, user: discord.Member, role: discord.Role):
+    await inter.response.defer()
+    await _role(inter, user, role)
 
-# ── FILTER ────────────────────────────────────────────────────────
-@bot.command(name="filter")
-@mod_check()
-async def prefix_filter(ctx, sub=None, word=None):
-    if sub == "add":
-        if not word:
-            return await ctx.reply(embed=error_embed("Missing Word", "Provide a word to filter."))
-        added = db_add_filter_word(ctx.guild.id, word)
-        await ctx.reply(embed=success_embed("Word Added", f"`{word}` added to filter.") if added
-                        else info_embed("Already Filtered", f"`{word}` is already in the filter."))
-    elif sub in ("remove", "del"):
-        if not word:
-            return await ctx.reply(embed=error_embed("Missing Word", "Provide a word to remove."))
-        removed = db_remove_filter_word(ctx.guild.id, word)
-        await ctx.reply(embed=success_embed("Word Removed", f"`{word}` removed.") if removed
-                        else error_embed("Not Found", f"`{word}` not in filter."))
+# ═══════════════════════════════════════════════════════════════
+#  PURGE
+# ═══════════════════════════════════════════════════════════════
+async def _purge(ctx_or_inter, amount: int):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not ctx_or_inter.guild.get_member(mod.id).guild_permissions.manage_messages:
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Messages permission.'))
+    if not 1 <= amount <= 100:
+        return await do_reply(ctx_or_inter, embed=error_embed('Invalid', 'Amount must be 1–100.'))
+    try:
+        ch = ctx_or_inter.channel
+        deleted = await ch.purge(limit=amount)
+        m = await ch.send(embed=success_embed('Purge Complete', f'Deleted **{len(deleted)}** messages.'))
+        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=4))
+        await m.delete()
+    except Exception as ex:
+        await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+
+@bot.command(name='purge', aliases=['clear', 'prune'])
+async def purge_cmd(ctx, amount: int = None):
+    if not amount: return await ctx.reply(embed=error_embed('Usage', '.purge <1-100>'))
+    await _purge(ctx, amount)
+
+@tree.command(name='purge', description='Bulk delete messages')
+@app_commands.describe(amount='Number of messages to delete (1-100)')
+async def purge_slash(inter: discord.Interaction, amount: int):
+    await inter.response.defer(ephemeral=True)
+    await _purge(inter, amount)
+
+# ═══════════════════════════════════════════════════════════════
+#  SLOWMODE
+# ═══════════════════════════════════════════════════════════════
+async def _slowmode(ctx_or_inter, seconds: int):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    if not 0 <= seconds <= 21600:
+        return await do_reply(ctx_or_inter, embed=error_embed('Invalid', 'Slowmode must be 0–21600 seconds.'))
+    try:
+        await ctx_or_inter.channel.edit(slowmode_delay=seconds)
+        msg = 'Slowmode disabled.' if seconds == 0 else f'Slowmode set to **{seconds}s**.'
+        await do_reply(ctx_or_inter, embed=success_embed('Slowmode Set', msg))
+    except Exception as ex:
+        await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+
+@bot.command(name='slowmode', aliases=['slow'])
+async def slowmode_cmd(ctx, seconds: int = None):
+    if seconds is None: return await ctx.reply(embed=error_embed('Usage', '.slowmode <0-21600>'))
+    await _slowmode(ctx, seconds)
+
+@tree.command(name='slowmode', description='Set channel slowmode')
+@app_commands.describe(seconds='Slowmode in seconds (0 to disable)')
+async def slowmode_slash(inter: discord.Interaction, seconds: int):
+    await inter.response.defer()
+    await _slowmode(inter, seconds)
+
+# ═══════════════════════════════════════════════════════════════
+#  FILTER
+# ═══════════════════════════════════════════════════════════════
+@bot.command(name='filter')
+async def filter_cmd(ctx, sub: str = None, *, word: str = None):
+    if not is_mod(ctx.author): return await ctx.reply(embed=error_embed('No Permission', 'You need moderation permissions.'))
+    if sub == 'add':
+        if not word: return await ctx.reply(embed=error_embed('Usage', '.filter add <word>'))
+        added = add_filter_word(ctx.guild.id, word)
+        await ctx.reply(embed=success_embed('Word Added', f'`{word}` added.') if added else info_embed('Already Filtered', f'`{word}` is already filtered.'))
+    elif sub in ('remove', 'del'):
+        if not word: return await ctx.reply(embed=error_embed('Usage', '.filter remove <word>'))
+        removed = remove_filter_word(ctx.guild.id, word)
+        await ctx.reply(embed=success_embed('Word Removed', f'`{word}` removed.') if removed else error_embed('Not Found', f'`{word}` not in filter.'))
+    elif sub == 'list' or sub is None:
+        words = get_filter_words(ctx.guild.id)
+        await ctx.reply(embed=info_embed('Filter List', f'`{"`, `".join(words)}`' if words else 'No filtered words.'))
     else:
-        words = db_get_filter_words(ctx.guild.id)
-        await ctx.reply(embed=info_embed("Filter List",
-            ", ".join(f"`{w}`" for w in words) if words else "No filtered words."))
+        await ctx.reply(embed=error_embed('Usage', '.filter add/remove/list [word]'))
 
-# ── AVATAR ───────────────────────────────────────────────────────
-@bot.command(name="avatar", aliases=["av", "pfp"])
-async def prefix_avatar(ctx, target=None):
-    user, _ = await resolve_user(ctx.guild, target or str(ctx.author.id))
-    user = user or ctx.author
-    embed = discord.Embed(title=f"🖼️ {user}'s Avatar", color=COLORS["info"],
-                          timestamp=datetime.now(timezone.utc))
-    embed.set_image(url=user.display_avatar.url)
-    png  = user.display_avatar.replace(format="png",  size=1024).url
-    webp = user.display_avatar.replace(format="webp", size=1024).url
-    jpg  = user.display_avatar.replace(format="jpg",  size=1024).url
-    embed.description = f"[PNG]({png}) | [WebP]({webp}) | [JPG]({jpg})"
-    await ctx.reply(embed=embed)
+@tree.command(name='filter_add', description='Add a word to the filter')
+@app_commands.describe(word='Word to filter')
+async def filter_add_slash(inter: discord.Interaction, word: str):
+    await inter.response.defer()
+    if not is_mod(inter.guild.get_member(inter.user.id)):
+        return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    added = add_filter_word(inter.guild.id, word)
+    await do_reply(inter, embed=success_embed('Word Added', f'`{word}` added.') if added else info_embed('Already Filtered', f'`{word}` is already filtered.'))
 
-# ── LOGSCHANNEL ──────────────────────────────────────────────────
-@bot.command(name="logschannel", aliases=["setlogs", "logs"])
-@admin_check()
-async def prefix_logschannel(ctx, channel: discord.TextChannel = None):
-    if not channel:
-        return await ctx.reply(embed=error_embed("Missing Channel", "Mention or provide a channel ID."))
-    db_set_config(ctx.guild.id, "logsChannelId", str(channel.id))
-    await ctx.reply(embed=success_embed("Logs Channel Set", f"All mod logs will be sent to {channel.mention}."))
+@tree.command(name='filter_remove', description='Remove a word from the filter')
+@app_commands.describe(word='Word to remove')
+async def filter_remove_slash(inter: discord.Interaction, word: str):
+    await inter.response.defer()
+    if not is_mod(inter.guild.get_member(inter.user.id)):
+        return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    removed = remove_filter_word(inter.guild.id, word)
+    await do_reply(inter, embed=success_embed('Word Removed', f'`{word}` removed.') if removed else error_embed('Not Found', f'`{word}` not in filter.'))
 
-# ── SERVERINFO ───────────────────────────────────────────────────
-@bot.command(name="serverinfo", aliases=["si", "server"])
-async def prefix_serverinfo(ctx):
-    g = ctx.guild
-    embed = discord.Embed(title=f"📊 {g.name}", color=COLORS["info"],
-                          timestamp=datetime.now(timezone.utc))
-    if g.icon:
-        embed.set_thumbnail(url=g.icon.url)
-    embed.add_field(name="👑 Owner",        value=f"<@{g.owner_id}>",                        inline=True)
-    embed.add_field(name="📅 Created",      value=f"<t:{int(g.created_at.timestamp())}:R>",  inline=True)
-    embed.add_field(name="👥 Members",      value=str(g.member_count),                       inline=True)
-    embed.add_field(name="💬 Channels",     value=str(len(g.channels)),                      inline=True)
-    embed.add_field(name="🎭 Roles",        value=str(len(g.roles)),                         inline=True)
-    embed.add_field(name="🌍 Locale",       value=str(g.preferred_locale),                   inline=True)
-    embed.add_field(name="🔒 Verification", value=str(g.verification_level),                 inline=True)
-    embed.add_field(name="🆔 Server ID",    value=str(g.id),                                 inline=True)
-    if g.description:
-        embed.description = g.description
-    if g.banner:
-        embed.set_image(url=g.banner.url)
-    await ctx.reply(embed=embed)
+@tree.command(name='filter_list', description='List all filtered words')
+async def filter_list_slash(inter: discord.Interaction):
+    await inter.response.defer()
+    if not is_mod(inter.guild.get_member(inter.user.id)):
+        return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    words = get_filter_words(inter.guild.id)
+    await do_reply(inter, embed=info_embed('Filter List', f'`{"`, `".join(words)}`' if words else 'No filtered words.'))
 
-# ── REVIEWPANEL ──────────────────────────────────────────────────
-@bot.command(name="reviewpanel", aliases=["cbpanel", "cbr"])
-@mod_check()
-async def prefix_reviewpanel(ctx, target=None):
-    if not target:
-        return await ctx.reply(embed=error_embed("Missing User", "Provide a user."))
-    user, _ = await resolve_user(ctx.guild, target)
-    if not user:
-        return await ctx.reply(embed=error_embed("User Not Found", "Could not find that user."))
-    chatban = db_get_chatban(ctx.guild.id, user.id)
-    warns   = db_get_warnings(ctx.guild.id, user.id)
-    embed = discord.Embed(title="🔍 Chatban Review Panel", color=COLORS["mod"],
-                          timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="User",          value=f"{user} (`{user.id}`)",                            inline=False)
-    embed.add_field(name="Status",        value="🔴 Currently Chatbanned" if chatban else "🟢 Not Chatbanned", inline=True)
-    embed.add_field(name="Warnings",      value=str(len(warns)),                                    inline=True)
-    embed.add_field(name="Chatban Reason",value=chatban.get("reason", "N/A") if chatban else "N/A", inline=False)
-    if chatban:
-        applied_ts = int(datetime.fromisoformat(chatban["appliedAt"]).timestamp())
-        embed.add_field(name="Applied", value=f"<t:{applied_ts}:R>", inline=True)
-        if chatban.get("expiresAt"):
-            exp_ts = int(datetime.fromisoformat(chatban["expiresAt"]).timestamp())
-            embed.add_field(name="Expires", value=f"<t:{exp_ts}:R>", inline=True)
-        else:
-            embed.add_field(name="Expires", value="Permanent", inline=True)
-    view = ReviewPanelView(user.id)
-    await ctx.reply(embed=embed, view=view)
+# ═══════════════════════════════════════════════════════════════
+#  AVATAR
+# ═══════════════════════════════════════════════════════════════
+async def _avatar(ctx_or_inter, target: discord.Member = None):
+    user = target or (ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user)
+    e = discord.Embed(title=f'🖼️ {user}\'s Avatar', color=COLORS['info'])
+    e.set_image(url=user.display_avatar.url)
+    e.description = (f'[PNG]({user.display_avatar.replace(format="png", size=1024).url}) | '
+                     f'[WebP]({user.display_avatar.replace(format="webp", size=1024).url}) | '
+                     f'[JPG]({user.display_avatar.replace(format="jpg", size=1024).url})')
+    await do_reply(ctx_or_inter, embed=e)
 
-# ── HELP ─────────────────────────────────────────────────────────
-@bot.command(name="help", aliases=["h", "commands"])
-async def prefix_help(ctx):
-    embed = discord.Embed(
-        title="📚 Moderation Bot Commands",
-        description="Prefix: `.` or `?` — All commands also available as `/command`",
-        color=COLORS["info"], timestamp=datetime.now(timezone.utc)
-    )
-    embed.add_field(name="⚠️ Warnings",
-        value="`warn <user> [reason]` • `warnings <user>` • `delwarn <user> <id>`", inline=False)
-    embed.add_field(name="🔇 Chat Restrictions",
-        value="`chatban <user> [reason]` • `unchatban <user>`\n`mute <user> <duration> [reason]` • `unmute <user>`", inline=False)
-    embed.add_field(name="🔨 Moderation",
-        value="`kick <user> [reason]` • `ban <user> [reason]` • `unban <id> [reason]`", inline=False)
-    embed.add_field(name="🔍 Information",
-        value="`usercheck <user>` • `avatar [user]` • `serverinfo`\n`note <user> <text>` • `notes <user>` • `delnote <user> <id>`", inline=False)
-    embed.add_field(name="📢 Channel Management",
-        value="`lock` • `unlock` • `lockdown` • `unlockall` • `nuke`\n`slowmode <seconds>` • `purge <amount>`", inline=False)
-    embed.add_field(name="🛡️ User Management",
-        value="`nickname <user> [name]` • `role <user> <role>`", inline=False)
-    embed.add_field(name="🚫 Filter",
-        value="`filter add <word>` • `filter remove <word>` • `filter list`", inline=False)
-    embed.add_field(name="⚙️ Config",
-        value="`logschannel <#channel>` • `reviewpanel <user>`", inline=False)
-    embed.set_footer(text="Duration format: 10m, 1h, 2d, 1w")
-    await ctx.reply(embed=embed)
+@bot.command(name='avatar', aliases=['av', 'pfp'])
+async def avatar_cmd(ctx, target: discord.Member = None):
+    await _avatar(ctx, target)
 
-# ════════════════════════════════════════════════════════════════
-#  REVIEW PANEL BUTTONS (View)
-# ════════════════════════════════════════════════════════════════
-class ReviewPanelView(discord.ui.View):
-    def __init__(self, user_id: int):
-        super().__init__(timeout=300)
-        self.user_id = user_id
+@tree.command(name='avatar', description="Show a user's avatar")
+@app_commands.describe(user='User (defaults to yourself)')
+async def avatar_slash(inter: discord.Interaction, user: discord.Member = None):
+    await inter.response.defer()
+    await _avatar(inter, user)
 
-    async def _check_perm(self, interaction: discord.Interaction) -> bool:
-        if not has_mod_permission(interaction.user):
-            await interaction.response.send_message(
-                embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-            return False
-        return True
+# ═══════════════════════════════════════════════════════════════
+#  SERVERINFO
+# ═══════════════════════════════════════════════════════════════
+async def _serverinfo(ctx_or_inter):
+    guild = ctx_or_inter.guild
+    e = discord.Embed(title=f'📊 {guild.name}', color=COLORS['info'], timestamp=discord.utils.utcnow())
+    if guild.icon: e.set_thumbnail(url=guild.icon.url)
+    if guild.banner: e.set_image(url=guild.banner.url)
+    e.add_field(name='👑 Owner', value=f'<@{guild.owner_id}>', inline=True)
+    e.add_field(name='📅 Created', value=discord.utils.format_dt(guild.created_at, 'R'), inline=True)
+    e.add_field(name='👥 Members', value=str(guild.member_count), inline=True)
+    e.add_field(name='💬 Channels', value=str(len(guild.channels)), inline=True)
+    e.add_field(name='🎭 Roles', value=str(len(guild.roles)), inline=True)
+    e.add_field(name='🌍 Locale', value=str(guild.preferred_locale), inline=True)
+    e.add_field(name='🆔 Server ID', value=str(guild.id), inline=True)
+    if guild.description: e.description = guild.description
+    await do_reply(ctx_or_inter, embed=e)
 
-    @discord.ui.button(label="⬆ Increase Ban", style=discord.ButtonStyle.danger,  custom_id="cbr_increase")
-    async def increase(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._check_perm(interaction): return
-        await interaction.response.defer()
-        existing = db_get_chatban(interaction.guild.id, self.user_id)
-        if existing:
-            existing["expiresAt"] = None
-            db_set_chatban(interaction.guild.id, self.user_id, existing)
-        else:
-            await apply_chatban(interaction.guild, self.user_id, "Review panel: increased", interaction.user.id)
-        user = await bot.fetch_user(self.user_id)
-        await interaction.followup.send(embed=warn_embed("Ban Increased", f"{user}'s chatban has been made permanent."))
+@bot.command(name='serverinfo', aliases=['si', 'server'])
+async def serverinfo_cmd(ctx): await _serverinfo(ctx)
 
-    @discord.ui.button(label="⬇ Decrease Ban", style=discord.ButtonStyle.primary, custom_id="cbr_decrease")
-    async def decrease(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._check_perm(interaction): return
-        await interaction.response.defer()
-        existing = db_get_chatban(interaction.guild.id, self.user_id)
-        if existing:
-            existing["expiresAt"] = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
-            db_set_chatban(interaction.guild.id, self.user_id, existing)
-        user = await bot.fetch_user(self.user_id)
-        await interaction.followup.send(embed=success_embed("Ban Decreased", f"{user}'s chatban reduced to 1 day."))
+@tree.command(name='serverinfo', description='Show server information')
+async def serverinfo_slash(inter: discord.Interaction):
+    await inter.response.defer()
+    await _serverinfo(inter)
 
-    @discord.ui.button(label="🔓 Remove Ban",   style=discord.ButtonStyle.success, custom_id="cbr_remove")
-    async def remove(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._check_perm(interaction): return
-        await interaction.response.defer()
-        await remove_chatban(interaction.guild, self.user_id)
-        db_add_mod_action(interaction.guild.id, self.user_id,
-                          {"type": "UNCHATBAN", "moderatorId": str(interaction.user.id), "reason": "Review panel: removed"})
-        user = await bot.fetch_user(self.user_id)
-        await interaction.followup.send(embed=success_embed("Chatban Removed", f"{user}'s chatban has been lifted."))
-        await send_log(interaction.guild,
-                       mod_embed("Chatban Removed (Panel)", interaction.user, user, "Review panel decision"))
+# ═══════════════════════════════════════════════════════════════
+#  LOGSCHANNEL
+# ═══════════════════════════════════════════════════════════════
+async def _logschannel(ctx_or_inter, channel: discord.TextChannel):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
+    set_config(ctx_or_inter.guild.id, 'logsChannelId', str(channel.id))
+    await do_reply(ctx_or_inter, embed=success_embed('Logs Channel Set', f'Mod logs will be sent to {channel.mention}.'))
 
-    @discord.ui.button(label="✅ Keep As-Is",   style=discord.ButtonStyle.secondary, custom_id="cbr_keep")
-    async def keep(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._check_perm(interaction): return
-        await interaction.response.defer()
-        user = await bot.fetch_user(self.user_id)
-        await interaction.followup.send(embed=info_embed("No Change", f"{user}'s chatban has been kept as-is."), ephemeral=True)
+@bot.command(name='logschannel', aliases=['setlogs', 'logs'])
+async def logschannel_cmd(ctx, channel: discord.TextChannel = None):
+    if not channel: return await ctx.reply(embed=error_embed('Usage', '.logschannel #channel'))
+    await _logschannel(ctx, channel)
 
-# ════════════════════════════════════════════════════════════════
-#  SLASH COMMANDS
-# ════════════════════════════════════════════════════════════════
-guild_obj = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
+@tree.command(name='logschannel', description='Set the mod logs channel')
+@app_commands.describe(channel='Channel for mod logs')
+async def logschannel_slash(inter: discord.Interaction, channel: discord.TextChannel):
+    await inter.response.defer()
+    await _logschannel(inter, channel)
 
-@bot.tree.command(name="warn", description="Warn a user", guild=guild_obj)
-@app_commands.describe(user="User to warn", reason="Reason for the warning")
-async def slash_warn(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    await do_warn(interaction.guild, interaction.user, str(user.id), reason,
-                  lambda **kw: interaction.followup.send(**kw))
+# ═══════════════════════════════════════════════════════════════
+#  WELCOMECHANNEL
+# ═══════════════════════════════════════════════════════════════
+async def _welcomechannel(ctx_or_inter, channel: discord.TextChannel):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
+    set_config(ctx_or_inter.guild.id, 'welcomeChannelId', str(channel.id))
+    await do_reply(ctx_or_inter, embed=success_embed('Welcome Channel Set', f'Welcome messages will be sent to {channel.mention}.\n\nThe bot also auto-detects any channel named `welcome`.'))
 
-@bot.tree.command(name="warnings", description="View warnings for a user", guild=guild_obj)
-@app_commands.describe(user="User to check")
-async def slash_warnings(interaction: discord.Interaction, user: discord.Member):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    warns = db_get_warnings(interaction.guild.id, user.id)
-    if not warns:
-        return await interaction.followup.send(embed=info_embed("No Warnings", f"{user} has no warnings."))
-    desc = "\n\n".join(
-        f"**#{i+1}** • <t:{int(datetime.fromisoformat(w['timestamp']).timestamp())}:R>\n> {w['reason']}\n> *by <@{w['moderatorId']}>* • ID: `{w['id']}`"
-        for i, w in enumerate(warns)
-    )
-    embed = discord.Embed(title=f"⚠️ Warnings for {user}", description=desc,
-                          color=COLORS["warn"], timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"{len(warns)} total warning(s)")
-    await interaction.followup.send(embed=embed)
+@bot.command(name='welcomechannel', aliases=['setwelcome'])
+async def welcomechannel_cmd(ctx, channel: discord.TextChannel = None):
+    if not channel: return await ctx.reply(embed=error_embed('Usage', '.welcomechannel #channel'))
+    await _welcomechannel(ctx, channel)
 
-@bot.tree.command(name="delwarn", description="Delete a warning", guild=guild_obj)
-@app_commands.describe(user="User", warning_id="Warning ID to delete")
-async def slash_delwarn(interaction: discord.Interaction, user: discord.Member, warning_id: str):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    try:
-        wid = int(warning_id)
-    except ValueError:
-        return await interaction.followup.send(embed=error_embed("Invalid ID", "Provide a valid warning ID."))
-    removed = db_remove_warning(interaction.guild.id, user.id, wid)
-    await interaction.followup.send(embed=success_embed("Warning Removed", f"Removed warning `{wid}` from {user}.") if removed
-                                    else error_embed("Not Found", "Warning ID not found."))
+@tree.command(name='welcomechannel', description='Set the welcome messages channel')
+@app_commands.describe(channel='Channel for welcome messages')
+async def welcomechannel_slash(inter: discord.Interaction, channel: discord.TextChannel):
+    await inter.response.defer()
+    await _welcomechannel(inter, channel)
 
-@bot.tree.command(name="chatban", description="Chatban a user", guild=guild_obj)
-@app_commands.describe(user="User to chatban", reason="Reason")
-async def slash_chatban(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    await apply_chatban(interaction.guild, user.id, reason, interaction.user.id)
-    db_add_mod_action(interaction.guild.id, user.id, {"type": "CHATBAN", "moderatorId": str(interaction.user.id), "reason": reason})
-    embed = mod_embed("Chatban Applied", interaction.user, user, reason)
-    await send_log(interaction.guild, embed)
-    await interaction.followup.send(embed=embed)
+# ═══════════════════════════════════════════════════════════════
+#  REVIEW PANEL
+# ═══════════════════════════════════════════════════════════════
+async def _reviewpanel(ctx_or_inter, target: discord.Member):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    cb = get_chatban(ctx_or_inter.guild.id, target.id)
+    ws = get_warnings(ctx_or_inter.guild.id, target.id)
+    e = discord.Embed(title='🔍 Chatban Review Panel', color=COLORS['mod'], timestamp=discord.utils.utcnow())
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.add_field(name='User', value=f'{target} (`{target.id}`)')
+    e.add_field(name='Status', value='🔴 Chatbanned' if cb else '🟢 Not Chatbanned', inline=True)
+    e.add_field(name='Warnings', value=str(len(ws)), inline=True)
+    e.add_field(name='Reason', value=cb['reason'] if cb else 'N/A', inline=False)
+    e.add_field(name='Applied', value=cb['applied_at'] if cb else 'N/A', inline=True)
+    e.add_field(name='Expires', value=cb.get('expires_at', 'Permanent') if cb else 'N/A', inline=True)
 
-@bot.tree.command(name="unchatban", description="Remove a chatban", guild=guild_obj)
-@app_commands.describe(user="User to unchatban")
-async def slash_unchatban(interaction: discord.Interaction, user: discord.Member):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    await remove_chatban(interaction.guild, user.id)
-    db_add_mod_action(interaction.guild.id, user.id, {"type": "UNCHATBAN", "moderatorId": str(interaction.user.id)})
-    embed = mod_embed("Chatban Removed", interaction.user, user, "Chatban lifted")
-    await send_log(interaction.guild, embed)
-    await interaction.followup.send(embed=embed)
+    view = discord.ui.View(timeout=300)
 
-@bot.tree.command(name="mute", description="Timeout/mute a user", guild=guild_obj)
-@app_commands.describe(user="User to mute", duration="Duration e.g. 10m, 1h, 2d", reason="Reason")
-async def slash_mute(interaction: discord.Interaction, user: discord.Member, duration: str, reason: str = "No reason provided"):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    await do_mute(interaction.guild, interaction.user, str(user.id), duration, reason,
-                  lambda **kw: interaction.followup.send(**kw))
+    async def make_button(label, style, action):
+        btn = discord.ui.Button(label=label, style=style)
+        async def callback(interaction: discord.Interaction):
+            if not is_mod(interaction.guild.get_member(interaction.user.id)):
+                return await interaction.response.send_message(embed=error_embed('No Permission', 'You need moderation permissions.'), ephemeral=True)
+            await interaction.response.defer()
+            if action == 'remove':
+                await remove_chatban(interaction.guild, target.id)
+                add_mod_action(interaction.guild.id, target.id, {'type': 'UNCHATBAN', 'moderator_id': str(interaction.user.id), 'reason': 'Review panel'})
+                await interaction.followup.send(embed=success_embed('Chatban Removed', f'{target}\'s chatban has been lifted.'))
+                await send_log(interaction.guild, mod_embed('Chatban Removed (Panel)', interaction.user, target, 'Review panel'))
+            elif action == 'increase':
+                existing = get_chatban(interaction.guild.id, target.id)
+                if existing:
+                    existing['expires_at'] = None
+                    set_chatban(interaction.guild.id, target.id, existing)
+                else:
+                    await apply_chatban(interaction.guild, target.id, 'Review panel: increased', interaction.user.id)
+                await interaction.followup.send(embed=warn_embed('Ban Increased', f'{target}\'s chatban is now permanent.'))
+            elif action == 'decrease':
+                existing = get_chatban(interaction.guild.id, target.id)
+                if existing:
+                    existing['expires_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 86400))
+                    set_chatban(interaction.guild.id, target.id, existing)
+                await interaction.followup.send(embed=success_embed('Ban Decreased', f'{target}\'s chatban reduced to 1 day.'))
+            elif action == 'keep':
+                await interaction.followup.send(embed=info_embed('No Change', f'{target}\'s chatban kept as-is.'), ephemeral=True)
+        btn.callback = callback
+        view.add_item(btn)
 
-@bot.tree.command(name="unmute", description="Remove a timeout from a user", guild=guild_obj)
-@app_commands.describe(user="User to unmute")
-async def slash_unmute(interaction: discord.Interaction, user: discord.Member):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    try:
-        await user.timeout(None, reason="Mute removed")
-    except Exception as e:
-        return await interaction.followup.send(embed=error_embed("Failed", str(e)))
-    db_add_mod_action(interaction.guild.id, user.id, {"type": "UNMUTE", "moderatorId": str(interaction.user.id)})
-    embed = mod_embed("Member Unmuted", interaction.user, user, "Mute removed")
-    await send_log(interaction.guild, embed)
-    await interaction.followup.send(embed=embed)
+    await make_button('⬆ Increase Ban', discord.ButtonStyle.danger, 'increase')
+    await make_button('⬇ Decrease Ban', discord.ButtonStyle.primary, 'decrease')
+    await make_button('🔓 Remove Ban', discord.ButtonStyle.success, 'remove')
+    await make_button('✅ Keep As-Is', discord.ButtonStyle.secondary, 'keep')
 
-@bot.tree.command(name="kick", description="Kick a member", guild=guild_obj)
-@app_commands.describe(user="User to kick", reason="Reason")
-async def slash_kick(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    if not interaction.user.guild_permissions.kick_members:
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Kick Members permission."), ephemeral=True)
-    await interaction.response.defer()
-    await do_kick(interaction.guild, interaction.user, str(user.id), reason,
-                  lambda **kw: interaction.followup.send(**kw))
+    await do_reply(ctx_or_inter, embed=e, view=view)
 
-@bot.tree.command(name="ban", description="Ban a user", guild=guild_obj)
-@app_commands.describe(user="User to ban", reason="Reason")
-async def slash_ban(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    if not interaction.user.guild_permissions.ban_members:
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Ban Members permission."), ephemeral=True)
-    await interaction.response.defer()
-    await do_ban(interaction.guild, interaction.user, str(user.id), reason,
-                 lambda **kw: interaction.followup.send(**kw))
+@bot.command(name='reviewpanel', aliases=['cbpanel', 'cbr'])
+async def reviewpanel_cmd(ctx, target: discord.Member = None):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.reviewpanel <user>'))
+    await _reviewpanel(ctx, target)
 
-@bot.tree.command(name="unban", description="Unban a user by ID", guild=guild_obj)
-@app_commands.describe(user_id="User ID to unban", reason="Reason")
-async def slash_unban(interaction: discord.Interaction, user_id: str, reason: str = "No reason provided"):
-    if not interaction.user.guild_permissions.ban_members:
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Ban Members permission."), ephemeral=True)
-    await interaction.response.defer()
-    try:
-        ban_entry = await interaction.guild.fetch_ban(discord.Object(id=int(user_id)))
-    except discord.NotFound:
-        return await interaction.followup.send(embed=error_embed("Not Banned", "That user is not banned."))
-    await interaction.guild.unban(ban_entry.user, reason=reason)
-    db_add_mod_action(interaction.guild.id, ban_entry.user.id, {"type": "UNBAN", "moderatorId": str(interaction.user.id), "reason": reason})
-    embed = mod_embed("Member Unbanned", interaction.user, ban_entry.user, reason)
-    await send_log(interaction.guild, embed)
-    await interaction.followup.send(embed=embed)
+@tree.command(name='reviewpanel', description='Open chatban review panel')
+@app_commands.describe(user='User to review')
+async def reviewpanel_slash(inter: discord.Interaction, user: discord.Member):
+    await inter.response.defer()
+    await _reviewpanel(inter, user)
 
-@bot.tree.command(name="usercheck", description="View user info and mod history", guild=guild_obj)
-@app_commands.describe(user="User to check")
-async def slash_usercheck(interaction: discord.Interaction, user: discord.Member):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    warns   = db_get_warnings(interaction.guild.id, user.id)
-    actions = db_get_mod_actions(interaction.guild.id, user.id)
-    age     = account_age_days(user)
-    embed = discord.Embed(title=f"🔍 User Check: {user}", color=COLORS["info"],
-                          timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="👤 User",            value=f"{user.mention} (`{user.id}`)",                 inline=True)
-    embed.add_field(name="📅 Account Created", value=f"<t:{int(user.created_at.timestamp())}:R>",     inline=True)
-    embed.add_field(name="📆 Account Age",     value=f"{age} days {'⚠️ NEW' if age < 7 else ''}",    inline=True)
-    embed.add_field(name="📥 Joined Server",   value=f"<t:{int(user.joined_at.timestamp())}:R>",      inline=True)
-    roles = [r.mention for r in user.roles if r.id != interaction.guild.id]
-    embed.add_field(name="🏷️ Roles", value=", ".join(roles) or "None", inline=False)
-    warn_val = "\n".join(
-        f"• {w['reason']} — <t:{int(datetime.fromisoformat(w['timestamp']).timestamp())}:R>"
-        for w in warns[-3:]
-    ) if warns else "None"
-    embed.add_field(name=f"⚠️ Warnings ({len(warns)})", value=warn_val, inline=False)
-    action_val = "\n".join(
-        f"• **{a['type']}** — {a.get('reason','')} <t:{int(datetime.fromisoformat(a['timestamp']).timestamp())}:R>"
-        for a in actions[-5:]
-    ) if actions else "None"
-    embed.add_field(name=f"🔨 Recent Actions ({len(actions)})", value=action_val, inline=False)
-    await interaction.followup.send(embed=embed)
+# ═══════════════════════════════════════════════════════════════
+#  HELP
+# ═══════════════════════════════════════════════════════════════
+async def _help(ctx_or_inter):
+    e = discord.Embed(title='📚 Moderation Bot Commands', description='Prefix: `.` or `?` — All commands also work as `/command`', color=COLORS['info'])
+    e.add_field(name='⚠️ Warnings', value='`warn` `warnings` `delwarn`', inline=True)
+    e.add_field(name='🔇 Restrictions', value='`chatban` `unchatban` `mute` `unmute`', inline=True)
+    e.add_field(name='🔨 Moderation', value='`kick` `ban` `unban`', inline=True)
+    e.add_field(name='🔍 Info', value='`usercheck` `avatar` `serverinfo`', inline=True)
+    e.add_field(name='📝 Notes', value='`note` `notes` `delnote`', inline=True)
+    e.add_field(name='📢 Channels', value='`lock` `unlock` `lockdown` `unlockall` `nuke`', inline=True)
+    e.add_field(name='🛠️ User Mgmt', value='`nickname` `role` `slowmode` `purge`', inline=True)
+    e.add_field(name='🚫 Filter', value='`filter add/remove/list`', inline=True)
+    e.add_field(name='⚙️ Config', value='`logschannel` `welcomechannel` `reviewpanel`', inline=True)
+    e.set_footer(text='Duration format: 10s, 10m, 1h, 2d, 1w')
+    await do_reply(ctx_or_inter, embed=e)
 
-@bot.tree.command(name="note", description="Add a private mod note to a user", guild=guild_obj)
-@app_commands.describe(user="User", text="Note text")
-async def slash_note(interaction: discord.Interaction, user: discord.Member, text: str):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    entry = db_add_note(interaction.guild.id, user.id, interaction.user.id, text)
-    await interaction.followup.send(embed=success_embed("Note Added",
-        f"Note added for {user}.\n> {text}\nID: `{entry['id']}`"))
+@bot.command(name='help', aliases=['h', 'commands'])
+async def help_cmd(ctx): await _help(ctx)
 
-@bot.tree.command(name="notes", description="View notes for a user", guild=guild_obj)
-@app_commands.describe(user="User")
-async def slash_notes(interaction: discord.Interaction, user: discord.Member):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    notes = db_get_notes(interaction.guild.id, user.id)
-    if not notes:
-        return await interaction.followup.send(embed=info_embed("No Notes", f"No notes for {user}."))
-    desc = "\n\n".join(
-        f"**#{i+1}** by <@{n['moderatorId']}> • <t:{int(datetime.fromisoformat(n['timestamp']).timestamp())}:R>\n> {n['note']}\n> ID: `{n['id']}`"
-        for i, n in enumerate(notes)
-    )
-    await interaction.followup.send(embed=discord.Embed(title=f"📝 Notes for {user}", description=desc,
-                                                         color=COLORS["info"], timestamp=datetime.now(timezone.utc)))
+@tree.command(name='help', description='Show all commands')
+async def help_slash(inter: discord.Interaction):
+    await inter.response.defer()
+    await _help(inter)
 
-@bot.tree.command(name="delnote", description="Delete a note", guild=guild_obj)
-@app_commands.describe(user="User", note_id="Note ID")
-async def slash_delnote(interaction: discord.Interaction, user: discord.Member, note_id: str):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    removed = db_remove_note(interaction.guild.id, user.id, int(note_id))
-    await interaction.followup.send(embed=success_embed("Note Deleted", "Note removed.") if removed
-                                    else error_embed("Not Found", "Note ID not found."))
-
-@bot.tree.command(name="lock", description="Lock the current channel", guild=guild_obj)
-async def slash_lock(interaction: discord.Interaction):
-    if not has_admin_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Manage Guild permission."), ephemeral=True)
-    await interaction.response.defer()
-    await interaction.channel.set_permissions(interaction.guild.default_role, send_messages=False)
-    await interaction.followup.send(embed=success_embed("Channel Locked", f"{interaction.channel.mention} is now locked."))
-
-@bot.tree.command(name="unlock", description="Unlock the current channel", guild=guild_obj)
-async def slash_unlock(interaction: discord.Interaction):
-    if not has_admin_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Manage Guild permission."), ephemeral=True)
-    await interaction.response.defer()
-    await interaction.channel.set_permissions(interaction.guild.default_role, send_messages=None)
-    await interaction.followup.send(embed=success_embed("Channel Unlocked", f"{interaction.channel.mention} is now unlocked."))
-
-@bot.tree.command(name="lockdown", description="Lock all channels", guild=guild_obj)
-async def slash_lockdown(interaction: discord.Interaction):
-    if not has_admin_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Manage Guild permission."), ephemeral=True)
-    await interaction.response.defer()
-    count = 0
-    for ch in interaction.guild.text_channels:
-        try:
-            await ch.set_permissions(interaction.guild.default_role, send_messages=False)
-            count += 1
-        except Exception:
-            pass
-    await interaction.followup.send(embed=warn_embed("Lockdown Active", f"Locked **{count}** channels."))
-
-@bot.tree.command(name="unlockall", description="Unlock all channels", guild=guild_obj)
-async def slash_unlockall(interaction: discord.Interaction):
-    if not has_admin_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Manage Guild permission."), ephemeral=True)
-    await interaction.response.defer()
-    count = 0
-    for ch in interaction.guild.text_channels:
-        try:
-            await ch.set_permissions(interaction.guild.default_role, send_messages=None)
-            count += 1
-        except Exception:
-            pass
-    await interaction.followup.send(embed=success_embed("Lockdown Lifted", f"Unlocked **{count}** channels."))
-
-@bot.tree.command(name="nuke", description="Clone and delete current channel", guild=guild_obj)
-async def slash_nuke(interaction: discord.Interaction):
-    if not has_admin_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Manage Guild permission."), ephemeral=True)
-    await interaction.response.defer()
-    channel = interaction.channel
-    new_ch = await channel.clone(name=channel.name, reason="Nuke command")
-    await new_ch.edit(position=channel.position)
-    await channel.delete(reason="Nuked")
-    await new_ch.send(embed=success_embed("Channel Nuked", "💣 Channel has been nuked and recreated. RIP to every message that didn't make it out alive. Thoughts and prayers. 🕯️"))
-    await new_ch.send(embed=success_embed("Channel Nuked", "💣 Channel has been nuked and recreated. RIP to every message that didn't make it out alive. Thoughts and prayers. 🕯️"))
-    await new_ch.send("https://tenor.com/view/pocoyo-dance-gif-12315046871291410991")
-@bot.tree.command(name="nickname", description="Force change a user's nickname", guild=guild_obj)
-@app_commands.describe(user="User", nickname="New nickname (leave empty to reset)")
-async def slash_nickname(interaction: discord.Interaction, user: discord.Member, nickname: str = None):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    await user.edit(nick=nickname, reason=f"Changed by {interaction.user}")
-    await interaction.followup.send(embed=success_embed("Nickname Changed",
-        f"{user.mention}'s nickname set to: **{nickname or '(reset)'}**"))
-
-@bot.tree.command(name="role", description="Add or remove a role from a user", guild=guild_obj)
-@app_commands.describe(user="User", role="Role to add/remove")
-async def slash_role(interaction: discord.Interaction, user: discord.Member, role: discord.Role):
-    if not has_admin_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Manage Guild permission."), ephemeral=True)
-    await interaction.response.defer()
-    if role in user.roles:
-        await user.remove_roles(role)
-        await interaction.followup.send(embed=success_embed("Role Removed", f"Removed {role.mention} from {user}."))
-    else:
-        await user.add_roles(role)
-        await interaction.followup.send(embed=success_embed("Role Added", f"Added {role.mention} to {user}."))
-
-@bot.tree.command(name="purge", description="Bulk delete messages", guild=guild_obj)
-@app_commands.describe(amount="Number of messages (1–100)")
-async def slash_purge(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100] = 10):
-    if not interaction.user.guild_permissions.manage_messages:
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Manage Messages permission."), ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=amount)
-    await interaction.followup.send(embed=success_embed("Purge Complete", f"Deleted **{len(deleted)}** messages."), ephemeral=True)
-
-@bot.tree.command(name="slowmode", description="Set channel slowmode", guild=guild_obj)
-@app_commands.describe(seconds="Seconds (0 to disable)")
-async def slash_slowmode(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 21600] = 0):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    await interaction.channel.edit(slowmode_delay=seconds)
-    await interaction.followup.send(embed=success_embed("Slowmode Set",
-        "Slowmode disabled." if seconds == 0 else f"Slowmode set to **{seconds}s**."))
-
-@bot.tree.command(name="avatar", description="Show a user's avatar", guild=guild_obj)
-@app_commands.describe(user="User (defaults to yourself)")
-async def slash_avatar(interaction: discord.Interaction, user: discord.Member = None):
-    await interaction.response.defer()
-    u = user or interaction.user
-    embed = discord.Embed(title=f"🖼️ {u}'s Avatar", color=COLORS["info"],
-                          timestamp=datetime.now(timezone.utc))
-    embed.set_image(url=u.display_avatar.url)
-    png  = u.display_avatar.replace(format="png",  size=1024).url
-    webp = u.display_avatar.replace(format="webp", size=1024).url
-    jpg  = u.display_avatar.replace(format="jpg",  size=1024).url
-    embed.description = f"[PNG]({png}) | [WebP]({webp}) | [JPG]({jpg})"
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="logschannel", description="Set the mod logs channel", guild=guild_obj)
-@app_commands.describe(channel="Channel for mod logs")
-async def slash_logschannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not has_admin_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need Manage Guild permission."), ephemeral=True)
-    await interaction.response.defer()
-    db_set_config(interaction.guild.id, "logsChannelId", str(channel.id))
-    await interaction.followup.send(embed=success_embed("Logs Channel Set", f"All mod logs will be sent to {channel.mention}."))
-
-@bot.tree.command(name="serverinfo", description="Show server information", guild=guild_obj)
-async def slash_serverinfo(interaction: discord.Interaction):
-    await interaction.response.defer()
-    g = interaction.guild
-    embed = discord.Embed(title=f"📊 {g.name}", color=COLORS["info"],
-                          timestamp=datetime.now(timezone.utc))
-    if g.icon:
-        embed.set_thumbnail(url=g.icon.url)
-    embed.add_field(name="👑 Owner",        value=f"<@{g.owner_id}>",                       inline=True)
-    embed.add_field(name="📅 Created",      value=f"<t:{int(g.created_at.timestamp())}:R>", inline=True)
-    embed.add_field(name="👥 Members",      value=str(g.member_count),                      inline=True)
-    embed.add_field(name="💬 Channels",     value=str(len(g.channels)),                     inline=True)
-    embed.add_field(name="🎭 Roles",        value=str(len(g.roles)),                        inline=True)
-    embed.add_field(name="🔒 Verification", value=str(g.verification_level),                inline=True)
-    embed.add_field(name="🆔 Server ID",    value=str(g.id),                                inline=True)
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="reviewpanel", description="Open chatban review panel for a user", guild=guild_obj)
-@app_commands.describe(user="User to review")
-async def slash_reviewpanel(interaction: discord.Interaction, user: discord.Member):
-    if not has_mod_permission(interaction.user):
-        return await interaction.response.send_message(embed=error_embed("No Permission", "You need moderation permissions."), ephemeral=True)
-    await interaction.response.defer()
-    chatban = db_get_chatban(interaction.guild.id, user.id)
-    warns   = db_get_warnings(interaction.guild.id, user.id)
-    embed = discord.Embed(title="🔍 Chatban Review Panel", color=COLORS["mod"],
-                          timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="User",    value=f"{user} (`{user.id}`)", inline=False)
-    embed.add_field(name="Status",  value="🔴 Currently Chatbanned" if chatban else "🟢 Not Chatbanned", inline=True)
-    embed.add_field(name="Warnings",value=str(len(warns)), inline=True)
-    embed.add_field(name="Chatban Reason", value=chatban.get("reason", "N/A") if chatban else "N/A", inline=False)
-    view = ReviewPanelView(user.id)
-    await interaction.followup.send(embed=embed, view=view)
-
-@bot.tree.command(name="help", description="Show all commands", guild=guild_obj)
-async def slash_help(interaction: discord.Interaction):
-    await interaction.response.defer()
-    embed = discord.Embed(
-        title="📚 Moderation Bot Commands",
-        description="Prefix: `.` or `?` — All commands also available as `/command`",
-        color=COLORS["info"], timestamp=datetime.now(timezone.utc)
-    )
-    embed.add_field(name="⚠️ Warnings",
-        value="`warn <user> [reason]` • `warnings <user>` • `delwarn <user> <id>`", inline=False)
-    embed.add_field(name="🔇 Chat Restrictions",
-        value="`chatban <user> [reason]` • `unchatban <user>`\n`mute <user> <duration> [reason]` • `unmute <user>`", inline=False)
-    embed.add_field(name="🔨 Moderation",
-        value="`kick <user> [reason]` • `ban <user> [reason]` • `unban <id> [reason]`", inline=False)
-    embed.add_field(name="🔍 Information",
-        value="`usercheck <user>` • `avatar [user]` • `serverinfo`\n`note <user> <text>` • `notes <user>` • `delnote <user> <id>`", inline=False)
-    embed.add_field(name="📢 Channel Management",
-        value="`lock` • `unlock` • `lockdown` • `unlockall` • `nuke`\n`slowmode <seconds>` • `purge <amount>`", inline=False)
-    embed.add_field(name="🛡️ User Management",
-        value="`nickname <user> [name]` • `role <user> <role>`", inline=False)
-    embed.add_field(name="🚫 Filter",
-        value="`filter add <word>` • `filter remove <word>` • `filter list`", inline=False)
-    embed.add_field(name="⚙️ Config",
-        value="`logschannel <#channel>` • `reviewpanel <user>`", inline=False)
-    embed.set_footer(text="Duration format: 10m, 1h, 2d, 1w")
-    await interaction.followup.send(embed=embed)
-
-# ════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #  RUN
-# ════════════════════════════════════════════════════════════════
-bot.run(TOKEN)
+# ═══════════════════════════════════════════════════════════════
+if not os.getenv('DISCORD_TOKEN'):
+    print('[ERROR] DISCORD_TOKEN not set. Check your .env file.')
+    exit(1)
+
+bot.run(os.getenv('DISCORD_TOKEN'))
