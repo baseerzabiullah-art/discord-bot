@@ -246,6 +246,90 @@ async def remove_chatban(guild, user_id):
     del_chatban(guild.id, user_id)
 
 # ═══════════════════════════════════════════════════════════════
+#  TRANSCRIPT HELPER
+# ═══════════════════════════════════════════════════════════════
+async def send_transcript(guild, ticket_channel, ticket_data):
+    """Collect all messages from ticket channel and post transcript."""
+    cfg = get_config(guild.id)
+    transcript_ch_id = cfg.get('transcriptChannelId')
+    if not transcript_ch_id:
+        return
+
+    transcript_ch = guild.get_channel(int(transcript_ch_id))
+    if not transcript_ch:
+        return
+
+    # Collect messages oldest first
+    messages = []
+    try:
+        async for msg in ticket_channel.history(limit=500, oldest_first=True):
+            if msg.author.bot and not msg.embeds:
+                continue
+            messages.append(msg)
+    except:
+        return
+
+    cat_info = TICKET_CATEGORIES.get(ticket_data.get('type', 'general'), TICKET_CATEGORIES['general'])
+    ticket_number = ticket_data.get('number', '?')
+    opener_id = ticket_data.get('user_id', '?')
+    opened_at = ticket_data.get('opened_at', 'Unknown')
+    closed_at = ticket_data.get('closed_at', _now())
+    closed_by_id = ticket_data.get('closed_by', '?')
+
+    # Build transcript text
+    lines = []
+    lines.append(f'TICKET TRANSCRIPT — #{ticket_number:04d}' if isinstance(ticket_number, int) else f'TICKET TRANSCRIPT — #{ticket_number}')
+    lines.append(f'Type     : {cat_info["label"]}')
+    lines.append(f'Opened by: {opener_id}')
+    lines.append(f'Opened at: {opened_at}')
+    lines.append(f'Closed by: {closed_by_id}')
+    lines.append(f'Closed at: {closed_at}')
+    lines.append(f'Messages : {len(messages)}')
+    lines.append('=' * 60)
+    lines.append('')
+
+    for msg in messages:
+        ts = msg.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        content = msg.content or ''
+        if msg.embeds:
+            for emb in msg.embeds:
+                title = emb.title or ''
+                desc = emb.description or ''
+                content += f'[Embed: {title} — {desc[:100]}]'
+        if msg.attachments:
+            for att in msg.attachments:
+                content += f' [Attachment: {att.url}]'
+        lines.append(f'[{ts}] {msg.author.display_name} ({msg.author.id}): {content}')
+
+    transcript_text = '\n'.join(lines)
+
+    # Send as a file attachment if long, otherwise in an embed
+    transcript_embed = discord.Embed(
+        title=f'📋 Ticket Transcript — #{ticket_number:04d}' if isinstance(ticket_number, int) else f'📋 Ticket Transcript — #{ticket_number}',
+        color=cat_info['color'],
+        timestamp=discord.utils.utcnow()
+    )
+    transcript_embed.add_field(name='📋 Type',      value=cat_info['label'],          inline=True)
+    transcript_embed.add_field(name='👤 Opened by', value=f'<@{opener_id}>',          inline=True)
+    transcript_embed.add_field(name='🔒 Closed by', value=f'<@{closed_by_id}>',       inline=True)
+    transcript_embed.add_field(name='📅 Opened',    value=opened_at,                  inline=True)
+    transcript_embed.add_field(name='📅 Closed',    value=closed_at,                  inline=True)
+    transcript_embed.add_field(name='💬 Messages',  value=str(len(messages)),         inline=True)
+    transcript_embed.set_footer(text=f'Channel: {ticket_channel.name}')
+
+    # Send as .txt file attachment
+    import io
+    file = discord.File(
+        fp=io.BytesIO(transcript_text.encode('utf-8')),
+        filename=f'transcript-{ticket_channel.name}.txt'
+    )
+
+    try:
+        await transcript_ch.send(embed=transcript_embed, file=file)
+    except:
+        pass
+
+# ═══════════════════════════════════════════════════════════════
 #  BOT SETUP
 # ═══════════════════════════════════════════════════════════════
 intents = discord.Intents.default()
@@ -273,18 +357,24 @@ class TicketControlView(discord.ui.View):
         if not is_owner and not is_mod(inter.guild.get_member(inter.user.id)):
             return await inter.response.send_message(embed=error_embed('No Permission', 'Only the ticket owner or staff can close this.'), ephemeral=True)
         await inter.response.defer()
+
+        ticket_data['open'] = False
+        ticket_data['closed_at'] = _now()
+        ticket_data['closed_by'] = str(inter.user.id)
+        save_ticket(inter.guild.id, inter.channel.id, ticket_data)
+
+        # Save transcript BEFORE deleting the channel
+        await send_transcript(inter.guild, inter.channel, ticket_data)
+
         embed = discord.Embed(
             title='🔒 Ticket Closing',
-            description='This ticket will be deleted in **5 seconds**.',
+            description='This ticket will be deleted in **5 seconds**.\n📋 Transcript has been saved.',
             color=COLORS['error'],
             timestamp=discord.utils.utcnow()
         )
         embed.add_field(name='Closed by', value=inter.user.mention)
         await inter.channel.send(embed=embed)
-        ticket_data['open'] = False
-        ticket_data['closed_at'] = _now()
-        ticket_data['closed_by'] = str(inter.user.id)
-        save_ticket(inter.guild.id, inter.channel.id, ticket_data)
+
         cat_info = TICKET_CATEGORIES.get(ticket_data.get('type', 'general'), TICKET_CATEGORIES['general'])
         log_embed = discord.Embed(title='🎫 Ticket Closed', color=COLORS['mod'], timestamp=discord.utils.utcnow())
         log_embed.add_field(name='Channel', value=inter.channel.name, inline=True)
@@ -292,6 +382,7 @@ class TicketControlView(discord.ui.View):
         log_embed.add_field(name='Closed by', value=inter.user.mention, inline=True)
         log_embed.add_field(name='Type', value=cat_info['label'], inline=True)
         await send_log(inter.guild, log_embed)
+
         await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
         try:
             await inter.channel.delete(reason=f'Ticket closed by {inter.user}')
@@ -458,6 +549,16 @@ async def on_ready():
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='over Sparky AI'))
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView())
+
+    # Auto-detect a channel named 'logs' and set as transcript channel if not already set
+    for guild in bot.guilds:
+        cfg = get_config(guild.id)
+        if not cfg.get('transcriptChannelId'):
+            logs_ch = discord.utils.get(guild.text_channels, name='logs')
+            if logs_ch:
+                set_config(guild.id, 'transcriptChannelId', str(logs_ch.id))
+                print(f'[AUTO] Set transcript channel to #logs ({logs_ch.id}) in {guild.name}')
+
     guild_id = os.getenv('GUILD_ID')
     if guild_id:
         g = discord.Object(id=int(guild_id))
@@ -1052,7 +1153,8 @@ async def _nuke(ctx_or_inter):
         new_ch = await ch.clone(reason=f'Nuked by {mod}')
         await new_ch.edit(position=ch.position)
         await ch.delete(reason=f'Nuked by {mod}')
-        await new_ch.send(embed=success_embed('Channel Nuked', '💣 Channel has been nuked and recreated.'))
+        await new_ch.send(embed=success_embed('Channel Nuked', '💣 Channel has been nuked and recreated. RIP to every message that didn\'t make it out alive. Thoughts and prayers. 🕯️'))
+        await new_ch.send('https://tenor.com/view/pocoyo-dance-gif-12315046871291410991')
         await send_log(ctx_or_inter.guild, mod_embed('Channel Nuked', mod, ch, 'Nuke command'))
     except Exception as ex:
         await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
@@ -1309,6 +1411,31 @@ async def welcomechannel_slash(inter: discord.Interaction, channel: discord.Text
     await _welcomechannel(inter, channel)
 
 # ═══════════════════════════════════════════════════════════════
+#  TRANSCRIPT CHANNEL
+# ═══════════════════════════════════════════════════════════════
+async def _transcriptchannel(ctx_or_inter, channel: discord.TextChannel):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
+    set_config(ctx_or_inter.guild.id, 'transcriptChannelId', str(channel.id))
+    await do_reply(ctx_or_inter, embed=success_embed(
+        'Transcript Channel Set',
+        f'Ticket transcripts will be saved to {channel.mention}.\n\n'
+        f'The bot also auto-detects a channel named `logs` if none is set.'
+    ))
+
+@bot.command(name='transcriptchannel', aliases=['settranscripts', 'transcripts'])
+async def transcriptchannel_cmd(ctx, channel: discord.TextChannel = None):
+    if not channel: return await ctx.reply(embed=error_embed('Usage', '.transcriptchannel #channel'))
+    await _transcriptchannel(ctx, channel)
+
+@tree.command(name='transcriptchannel', description='Set the channel where ticket transcripts are saved')
+@app_commands.describe(channel='Channel for ticket transcripts')
+async def transcriptchannel_slash(inter: discord.Interaction, channel: discord.TextChannel):
+    await inter.response.defer()
+    await _transcriptchannel(inter, channel)
+
+# ═══════════════════════════════════════════════════════════════
 #  REVIEW PANEL
 # ═══════════════════════════════════════════════════════════════
 async def _reviewpanel(ctx_or_inter, target: discord.Member):
@@ -1417,17 +1544,17 @@ async def ticketpanel_slash(inter: discord.Interaction, channel: discord.TextCha
 # ═══════════════════════════════════════════════════════════════
 async def _help(ctx_or_inter):
     e = discord.Embed(title='📚 Moderation Bot Commands', description='Prefix: `.` or `?` — All commands also work as `/command`', color=COLORS['info'])
-    e.add_field(name='⚠️ Warnings', value='`warn` `warnings` `delwarn`', inline=True)
-    e.add_field(name='🔇 Restrictions', value='`chatban` `unchatban` `mute` `unmute`', inline=True)
-    e.add_field(name='🔨 Moderation', value='`kick` `ban` `unban`', inline=True)
-    e.add_field(name='🔍 Info', value='`usercheck` `avatar` `serverinfo`', inline=True)
-    e.add_field(name='📝 Notes', value='`note` `notes` `delnote`', inline=True)
-    e.add_field(name='📢 Channels', value='`lock` `unlock` `lockdown` `unlockall` `nuke`', inline=True)
-    e.add_field(name='🛠️ User Mgmt', value='`nickname` `role` `slowmode` `purge`', inline=True)
-    e.add_field(name='🚫 Filter', value='`filter add/remove/list`', inline=True)
-    e.add_field(name='🎫 Tickets', value='`ticketpanel [#channel]`', inline=True)
-    e.add_field(name='⚙️ Config', value='`logschannel` `welcomechannel` `reviewpanel`', inline=True)
-    e.set_footer(text='Duration format: 10s, 10m, 1h, 2d, 1w')
+    e.add_field(name='⚠️ Warnings',      value='`warn` `warnings` `delwarn`',                                   inline=True)
+    e.add_field(name='🔇 Restrictions',  value='`chatban` `unchatban` `mute` `unmute`',                         inline=True)
+    e.add_field(name='🔨 Moderation',    value='`kick` `ban` `unban`',                                          inline=True)
+    e.add_field(name='🔍 Info',          value='`usercheck` `avatar` `serverinfo`',                             inline=True)
+    e.add_field(name='📝 Notes',         value='`note` `notes` `delnote`',                                      inline=True)
+    e.add_field(name='📢 Channels',      value='`lock` `unlock` `lockdown` `unlockall` `nuke`',                 inline=True)
+    e.add_field(name='🛠️ User Mgmt',    value='`nickname` `role` `slowmode` `purge`',                          inline=True)
+    e.add_field(name='🚫 Filter',        value='`filter add/remove/list`',                                      inline=True)
+    e.add_field(name='🎫 Tickets',       value='`ticketpanel [#channel]`',                                      inline=True)
+    e.add_field(name='⚙️ Config',        value='`logschannel` `welcomechannel` `transcriptchannel` `reviewpanel`', inline=True)
+    e.set_footer(text='Duration format: 10s, 10m, 1h, 2d, 1w  |  Transcripts auto-save to #logs if set')
     await do_reply(ctx_or_inter, embed=e)
 
 @bot.command(name='help', aliases=['h', 'commands'])
