@@ -430,6 +430,172 @@ class AddUserModal(discord.ui.Modal, title='Add User to Ticket'):
         await inter.response.send_message(embed=success_embed('User Added', f'{member.mention} has been added to this ticket.'))
 
 
+RULES_LINK = 'https://discord.com/channels/1507699367123877979/1508243878652936282'
+
+
+async def _create_ticket_channel(inter: discord.Interaction, ticket_type: str, form_data: dict):
+    """Actually creates the ticket channel. Called after pre-screening is complete."""
+    guild = inter.guild
+    user = inter.user
+    cat_info = TICKET_CATEGORIES[ticket_type]
+    existing_tickets = get_tickets(guild.id)
+
+    ticket_category = discord.utils.get(guild.categories, name='Tickets')
+    if not ticket_category:
+        ticket_category = await guild.create_category('Tickets')
+
+    ticket_number = len(existing_tickets) + 1
+    channel_name = f'ticket-{ticket_number:04d}-{user.name[:12].lower().replace(" ", "-")}'
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+    }
+    for role in guild.roles:
+        if role.permissions.manage_messages or role.permissions.administrator:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    ticket_ch = await ticket_category.create_text_channel(
+        channel_name,
+        overwrites=overwrites,
+        topic=f'{cat_info["label"]} ticket by {user} | Type: {ticket_type}'
+    )
+
+    save_ticket(guild.id, ticket_ch.id, {
+        'user_id': str(user.id),
+        'type': ticket_type,
+        'opened_at': _now(),
+        'open': True,
+        'number': ticket_number,
+        'claimed_by': None
+    })
+
+    # Build description from form answers
+    if ticket_type == 'support':
+        description = (
+            f'**Issue:**\n> {form_data.get("issue", "Not provided")}\n\n'
+            f'**Resolution requested:**\n> {form_data.get("resolution", "Not provided")}\n\n'
+            'A staff member will be with you shortly.'
+        )
+    elif ticket_type == 'general':
+        description = (
+            f'**Question:**\n> {form_data.get("question", "Not provided")}\n\n'
+            f'**Additional context:**\n> {form_data.get("context", "Not provided")}\n\n'
+            'A staff member will reply as soon as possible.'
+        )
+    else:
+        description = (
+            'Thanks for your interest in **Sparky AI**! 🎉\n\n'
+            '> 🔹 Which plan are you interested in?\n'
+            '> 🔹 Do you have any questions before purchasing?\n'
+            '> 🔹 Looking for a custom or enterprise deal?\n\n'
+            'A team member will be with you shortly.'
+        )
+
+    embed = discord.Embed(
+        title=f'{cat_info["label"]} — Ticket #{ticket_number:04d}',
+        description=description,
+        color=cat_info['color'],
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name='👤 Opened by', value=user.mention, inline=True)
+    embed.add_field(name='📋 Type', value=cat_info['label'], inline=True)
+    embed.add_field(name='📅 Opened', value=discord.utils.format_dt(discord.utils.utcnow(), 'R'), inline=True)
+    embed.set_footer(text='Use the buttons below to manage this ticket.')
+
+    await ticket_ch.send(content=user.mention, embed=embed, view=TicketControlView())
+
+    log_embed = discord.Embed(title='🎫 Ticket Opened', color=cat_info['color'], timestamp=discord.utils.utcnow())
+    log_embed.add_field(name='User', value=f'{user.mention} (`{user.id}`)', inline=True)
+    log_embed.add_field(name='Type', value=cat_info['label'], inline=True)
+    log_embed.add_field(name='Channel', value=ticket_ch.mention, inline=True)
+    await send_log(guild, log_embed)
+
+    return ticket_ch
+
+
+# ── Support form modal ───────────────────────────────────────────
+class SupportFormModal(discord.ui.Modal, title='Support Ticket — Tell us more'):
+    issue = discord.ui.TextInput(
+        label='What is your issue?',
+        style=discord.TextStyle.paragraph,
+        placeholder='Describe your problem in as much detail as possible...',
+        max_length=1000
+    )
+    resolution = discord.ui.TextInput(
+        label='How can we resolve this?',
+        style=discord.TextStyle.paragraph,
+        placeholder='What outcome are you hoping for?',
+        max_length=500
+    )
+
+    async def on_submit(self, inter: discord.Interaction):
+        ticket_ch = await _create_ticket_channel(inter, 'support', {
+            'issue': self.issue.value,
+            'resolution': self.resolution.value
+        })
+        await inter.response.send_message(
+            embed=success_embed('Ticket Created', f'Your support ticket has been opened: {ticket_ch.mention}'),
+            ephemeral=True
+        )
+
+
+# ── General question form modal ──────────────────────────────────
+class GeneralFormModal(discord.ui.Modal, title='General Question — Tell us more'):
+    question = discord.ui.TextInput(
+        label='What is your question?',
+        style=discord.TextStyle.paragraph,
+        placeholder='Be as specific as possible...',
+        max_length=1000
+    )
+    context = discord.ui.TextInput(
+        label='Any additional context?',
+        style=discord.TextStyle.paragraph,
+        placeholder='Include any relevant details that might help us answer...',
+        max_length=500,
+        required=False
+    )
+
+    async def on_submit(self, inter: discord.Interaction):
+        ticket_ch = await _create_ticket_channel(inter, 'general', {
+            'question': self.question.value,
+            'context': self.context.value or 'None provided'
+        })
+        await inter.response.send_message(
+            embed=success_embed('Ticket Created', f'Your ticket has been opened: {ticket_ch.mention}'),
+            ephemeral=True
+        )
+
+
+# ── Rules check view (Yes / No buttons) ─────────────────────────
+class RulesCheckView(discord.ui.View):
+    def __init__(self, ticket_type: str):
+        super().__init__(timeout=120)
+        self.ticket_type = ticket_type
+
+    @discord.ui.button(label='✅ Yes, I have read the rules', style=discord.ButtonStyle.success)
+    async def yes_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        # Open the appropriate form modal
+        if self.ticket_type == 'support':
+            await inter.response.send_modal(SupportFormModal())
+        else:
+            await inter.response.send_modal(GeneralFormModal())
+
+    @discord.ui.button(label='❌ No', style=discord.ButtonStyle.danger)
+    async def no_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        await inter.response.edit_message(
+            embed=error_embed(
+                'Ticket Cancelled',
+                f'Please read our rules before opening a ticket.\n\n'
+                f'📖 **Rules channel:** {RULES_LINK}\n\n'
+                f'Once you have read the rules, feel free to open a new ticket.'
+            ),
+            view=None
+        )
+
+
 class TicketTypeSelect(discord.ui.Select):
     def __init__(self):
         options = [
@@ -443,8 +609,8 @@ class TicketTypeSelect(discord.ui.Select):
         ticket_type = self.values[0]
         guild = inter.guild
         user = inter.user
-        cat_info = TICKET_CATEGORIES[ticket_type]
 
+        # Check for existing open ticket
         existing_tickets = get_tickets(guild.id)
         for ch_id, tdata in existing_tickets.items():
             if str(tdata.get('user_id')) == str(user.id) and tdata.get('open'):
@@ -455,83 +621,45 @@ class TicketTypeSelect(discord.ui.Select):
                         ephemeral=True
                     )
 
-        await inter.response.defer(ephemeral=True)
+        # Purchase tickets skip pre-screening and open directly
+        if ticket_type == 'purchase':
+            await inter.response.defer(ephemeral=True)
+            ticket_ch = await _create_ticket_channel(inter, 'purchase', {})
+            await inter.followup.send(
+                embed=success_embed('Ticket Created', f'Your ticket has been opened: {ticket_ch.mention}'),
+                ephemeral=True
+            )
+            return
 
-        ticket_category = discord.utils.get(guild.categories, name='Tickets')
-        if not ticket_category:
-            ticket_category = await guild.create_category('Tickets')
+        # Support & General — show rules check first
+        if ticket_type == 'support':
+            pre_embed = discord.Embed(
+                title='🛠️ Before you open a Support ticket...',
+                description=(
+                    f'**Have you read our rules?**\n'
+                    f'👉 {RULES_LINK}\n\n'
+                    f'Please make sure you have read our rules before opening a ticket. '
+                    f'This helps us assist you faster and keeps things running smoothly.'
+                ),
+                color=COLORS['warn']
+            )
+            pre_embed.add_field(name='📋 You will be asked:', value='• What is your issue?\n• How can we resolve this?', inline=False)
+            pre_embed.set_footer(text='This prompt will expire in 2 minutes.')
+        else:
+            pre_embed = discord.Embed(
+                title='💬 Before you open a General Question ticket...',
+                description=(
+                    f'**Have you read our rules?**\n'
+                    f'👉 {RULES_LINK}\n\n'
+                    f'Please make sure you have read our rules before opening a ticket. '
+                    f'Quick questions may already be answered in our FAQ or rules channel!'
+                ),
+                color=COLORS['warn']
+            )
+            pre_embed.add_field(name='📋 You will be asked:', value='• What is your question?\n• Any additional context?', inline=False)
+            pre_embed.set_footer(text='This prompt will expire in 2 minutes.')
 
-        ticket_number = len(existing_tickets) + 1
-        channel_name = f'ticket-{ticket_number:04d}-{user.name[:12].lower().replace(" ", "-")}'
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
-        }
-        for role in guild.roles:
-            if role.permissions.manage_messages or role.permissions.administrator:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-        ticket_ch = await ticket_category.create_text_channel(
-            channel_name,
-            overwrites=overwrites,
-            topic=f'{cat_info["label"]} ticket by {user} | Type: {ticket_type}'
-        )
-
-        save_ticket(guild.id, ticket_ch.id, {
-            'user_id': str(user.id),
-            'type': ticket_type,
-            'opened_at': _now(),
-            'open': True,
-            'number': ticket_number,
-            'claimed_by': None
-        })
-
-        descriptions = {
-            'support': (
-                'Please describe your issue in as much detail as possible.\n\n'
-                '> 🔹 What went wrong?\n'
-                '> 🔹 When did it happen?\n'
-                '> 🔹 Any screenshots or error messages?\n\n'
-                'A staff member will be with you shortly.'
-            ),
-            'purchase': (
-                'Thanks for your interest in **Sparky AI**! 🎉\n\n'
-                '> 🔹 Which plan are you interested in?\n'
-                '> 🔹 Do you have any questions before purchasing?\n'
-                '> 🔹 Looking for a custom or enterprise deal?\n\n'
-                'A team member will be with you shortly.'
-            ),
-            'general': (
-                'Go ahead and ask your question below!\n\n'
-                '> 🔹 Be as specific as possible.\n'
-                '> 🔹 Include any relevant context.\n\n'
-                'A staff member will reply as soon as possible.'
-            ),
-        }
-
-        embed = discord.Embed(
-            title=f'{cat_info["label"]} — Ticket #{ticket_number:04d}',
-            description=descriptions[ticket_type],
-            color=cat_info['color'],
-            timestamp=discord.utils.utcnow()
-        )
-        embed.set_thumbnail(url=user.display_avatar.url)
-        embed.add_field(name='👤 Opened by', value=user.mention, inline=True)
-        embed.add_field(name='📋 Type', value=cat_info['label'], inline=True)
-        embed.add_field(name='📅 Opened', value=discord.utils.format_dt(discord.utils.utcnow(), 'R'), inline=True)
-        embed.set_footer(text='Use the buttons below to manage this ticket.')
-
-        await ticket_ch.send(content=user.mention, embed=embed, view=TicketControlView())
-
-        log_embed = discord.Embed(title='🎫 Ticket Opened', color=cat_info['color'], timestamp=discord.utils.utcnow())
-        log_embed.add_field(name='User', value=f'{user.mention} (`{user.id}`)', inline=True)
-        log_embed.add_field(name='Type', value=cat_info['label'], inline=True)
-        log_embed.add_field(name='Channel', value=ticket_ch.mention, inline=True)
-        await send_log(guild, log_embed)
-
-        await inter.followup.send(embed=success_embed('Ticket Created', f'Your ticket has been opened: {ticket_ch.mention}'), ephemeral=True)
+        await inter.response.send_message(embed=pre_embed, view=RulesCheckView(ticket_type), ephemeral=True)
 
 
 class TicketPanelView(discord.ui.View):
