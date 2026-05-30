@@ -14,6 +14,12 @@ WELCOME_GIF = 'https://media.giphy.com/media/xT9IgzoKnwFNmISR8I/giphy.gif'
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 os.makedirs(DATA_DIR, exist_ok=True)
 
+TICKET_CATEGORIES = {
+    'support':  {'label': '🛠️ Support',         'description': 'Get help with a technical issue',     'color': 0x5865F2},
+    'purchase': {'label': '💳 Buy Sparky AI',    'description': 'Purchase or enquire about Sparky AI', 'color': 0x57F287},
+    'general':  {'label': '💬 General Question', 'description': 'Ask us anything',                     'color': 0xFEE75C},
+}
+
 # ═══════════════════════════════════════════════════════════════
 #  DATABASE
 # ═══════════════════════════════════════════════════════════════
@@ -125,6 +131,21 @@ def del_chatban(guild_id, user_id):
         del data[gid][uid]
         _save('chatbans.json', data)
 
+def get_tickets(guild_id):
+    return _load('tickets.json').get(str(guild_id), {})
+
+def save_ticket(guild_id, channel_id, data):
+    all_data = _load('tickets.json')
+    all_data.setdefault(str(guild_id), {})[str(channel_id)] = data
+    _save('tickets.json', all_data)
+
+def delete_ticket_record(guild_id, channel_id):
+    all_data = _load('tickets.json')
+    gid = str(guild_id)
+    if gid in all_data and str(channel_id) in all_data[gid]:
+        del all_data[gid][str(channel_id)]
+        _save('tickets.json', all_data)
+
 # ═══════════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════
@@ -147,7 +168,7 @@ def info_embed(title, desc):
 
 def mod_embed(action, moderator, target, reason, extra=None):
     e = discord.Embed(title=f'🔨 {action}', color=COLORS['mod'], timestamp=discord.utils.utcnow())
-    e.add_field(name='Target', value=f'{target} (`{getattr(target,"id",target)}`)', inline=True)
+    e.add_field(name='Target', value=f'{target} (`{getattr(target, "id", target)}`)', inline=True)
     e.add_field(name='Moderator', value=str(moderator), inline=True)
     e.add_field(name='Reason', value=reason or 'No reason provided', inline=False)
     if extra:
@@ -237,12 +258,206 @@ tree = bot.tree
 spam_map = {}
 
 # ═══════════════════════════════════════════════════════════════
+#  TICKET VIEWS
+# ═══════════════════════════════════════════════════════════════
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='🔒 Close Ticket', style=discord.ButtonStyle.danger, custom_id='ticket_close')
+    async def close_ticket(self, inter: discord.Interaction, button: discord.ui.Button):
+        ticket_data = get_tickets(inter.guild.id).get(str(inter.channel.id))
+        if not ticket_data:
+            return await inter.response.send_message(embed=error_embed('Error', 'This is not a tracked ticket.'), ephemeral=True)
+        is_owner = str(inter.user.id) == str(ticket_data.get('user_id'))
+        if not is_owner and not is_mod(inter.guild.get_member(inter.user.id)):
+            return await inter.response.send_message(embed=error_embed('No Permission', 'Only the ticket owner or staff can close this.'), ephemeral=True)
+        await inter.response.defer()
+        embed = discord.Embed(
+            title='🔒 Ticket Closing',
+            description='This ticket will be deleted in **5 seconds**.',
+            color=COLORS['error'],
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name='Closed by', value=inter.user.mention)
+        await inter.channel.send(embed=embed)
+        ticket_data['open'] = False
+        ticket_data['closed_at'] = _now()
+        ticket_data['closed_by'] = str(inter.user.id)
+        save_ticket(inter.guild.id, inter.channel.id, ticket_data)
+        cat_info = TICKET_CATEGORIES.get(ticket_data.get('type', 'general'), TICKET_CATEGORIES['general'])
+        log_embed = discord.Embed(title='🎫 Ticket Closed', color=COLORS['mod'], timestamp=discord.utils.utcnow())
+        log_embed.add_field(name='Channel', value=inter.channel.name, inline=True)
+        log_embed.add_field(name='Opened by', value=f'<@{ticket_data["user_id"]}>', inline=True)
+        log_embed.add_field(name='Closed by', value=inter.user.mention, inline=True)
+        log_embed.add_field(name='Type', value=cat_info['label'], inline=True)
+        await send_log(inter.guild, log_embed)
+        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
+        try:
+            await inter.channel.delete(reason=f'Ticket closed by {inter.user}')
+            delete_ticket_record(inter.guild.id, inter.channel.id)
+        except: pass
+
+    @discord.ui.button(label='👋 Claim', style=discord.ButtonStyle.primary, custom_id='ticket_claim')
+    async def claim_ticket(self, inter: discord.Interaction, button: discord.ui.Button):
+        if not is_mod(inter.guild.get_member(inter.user.id)):
+            return await inter.response.send_message(embed=error_embed('No Permission', 'Only staff can claim tickets.'), ephemeral=True)
+        ticket_data = get_tickets(inter.guild.id).get(str(inter.channel.id))
+        if not ticket_data:
+            return await inter.response.send_message(embed=error_embed('Error', 'This is not a tracked ticket.'), ephemeral=True)
+        if ticket_data.get('claimed_by'):
+            claimer = inter.guild.get_member(int(ticket_data['claimed_by']))
+            return await inter.response.send_message(embed=warn_embed('Already Claimed', f'This ticket is already claimed by {claimer.mention if claimer else "someone"}.'), ephemeral=True)
+        ticket_data['claimed_by'] = str(inter.user.id)
+        save_ticket(inter.guild.id, inter.channel.id, ticket_data)
+        await inter.response.send_message(embed=success_embed('Ticket Claimed', f'{inter.user.mention} has claimed this ticket and will assist you shortly.'))
+        button.label = f'✅ Claimed by {inter.user.display_name}'
+        button.disabled = True
+        await inter.message.edit(view=self)
+
+    @discord.ui.button(label='➕ Add User', style=discord.ButtonStyle.secondary, custom_id='ticket_adduser')
+    async def add_user(self, inter: discord.Interaction, button: discord.ui.Button):
+        if not is_mod(inter.guild.get_member(inter.user.id)):
+            return await inter.response.send_message(embed=error_embed('No Permission', 'Only staff can add users.'), ephemeral=True)
+        await inter.response.send_modal(AddUserModal(inter.channel))
+
+
+class AddUserModal(discord.ui.Modal, title='Add User to Ticket'):
+    user_id = discord.ui.TextInput(label='User ID or mention', placeholder='123456789012345678')
+
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+
+    async def on_submit(self, inter: discord.Interaction):
+        cleaned = self.user_id.value.strip().replace('<@', '').replace('>', '').replace('!', '')
+        try:
+            member = inter.guild.get_member(int(cleaned)) or await inter.guild.fetch_member(int(cleaned))
+        except:
+            return await inter.response.send_message(embed=error_embed('Not Found', 'Could not find that user.'), ephemeral=True)
+        await self.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+        await inter.response.send_message(embed=success_embed('User Added', f'{member.mention} has been added to this ticket.'))
+
+
+class TicketTypeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label='🛠️ Support',         value='support',  description='Get help with a technical issue'),
+            discord.SelectOption(label='💳 Buy Sparky AI',   value='purchase', description='Purchase or enquire about Sparky AI'),
+            discord.SelectOption(label='💬 General Question', value='general',  description='Ask us anything'),
+        ]
+        super().__init__(placeholder='Choose a ticket type...', min_values=1, max_values=1, options=options, custom_id='ticket_type_select')
+
+    async def callback(self, inter: discord.Interaction):
+        ticket_type = self.values[0]
+        guild = inter.guild
+        user = inter.user
+        cat_info = TICKET_CATEGORIES[ticket_type]
+
+        existing_tickets = get_tickets(guild.id)
+        for ch_id, tdata in existing_tickets.items():
+            if str(tdata.get('user_id')) == str(user.id) and tdata.get('open'):
+                ch = guild.get_channel(int(ch_id))
+                if ch:
+                    return await inter.response.send_message(
+                        embed=error_embed('Ticket Already Open', f'You already have an open ticket: {ch.mention}'),
+                        ephemeral=True
+                    )
+
+        await inter.response.defer(ephemeral=True)
+
+        ticket_category = discord.utils.get(guild.categories, name='Tickets')
+        if not ticket_category:
+            ticket_category = await guild.create_category('Tickets')
+
+        ticket_number = len(existing_tickets) + 1
+        channel_name = f'ticket-{ticket_number:04d}-{user.name[:12].lower().replace(" ", "-")}'
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+        }
+        for role in guild.roles:
+            if role.permissions.manage_messages or role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        ticket_ch = await ticket_category.create_text_channel(
+            channel_name,
+            overwrites=overwrites,
+            topic=f'{cat_info["label"]} ticket by {user} | Type: {ticket_type}'
+        )
+
+        save_ticket(guild.id, ticket_ch.id, {
+            'user_id': str(user.id),
+            'type': ticket_type,
+            'opened_at': _now(),
+            'open': True,
+            'number': ticket_number,
+            'claimed_by': None
+        })
+
+        descriptions = {
+            'support': (
+                'Please describe your issue in as much detail as possible.\n\n'
+                '> 🔹 What went wrong?\n'
+                '> 🔹 When did it happen?\n'
+                '> 🔹 Any screenshots or error messages?\n\n'
+                'A staff member will be with you shortly.'
+            ),
+            'purchase': (
+                'Thanks for your interest in **Sparky AI**! 🎉\n\n'
+                '> 🔹 Which plan are you interested in?\n'
+                '> 🔹 Do you have any questions before purchasing?\n'
+                '> 🔹 Looking for a custom or enterprise deal?\n\n'
+                'A team member will be with you shortly.'
+            ),
+            'general': (
+                'Go ahead and ask your question below!\n\n'
+                '> 🔹 Be as specific as possible.\n'
+                '> 🔹 Include any relevant context.\n\n'
+                'A staff member will reply as soon as possible.'
+            ),
+        }
+
+        embed = discord.Embed(
+            title=f'{cat_info["label"]} — Ticket #{ticket_number:04d}',
+            description=descriptions[ticket_type],
+            color=cat_info['color'],
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(name='👤 Opened by', value=user.mention, inline=True)
+        embed.add_field(name='📋 Type', value=cat_info['label'], inline=True)
+        embed.add_field(name='📅 Opened', value=discord.utils.format_dt(discord.utils.utcnow(), 'R'), inline=True)
+        embed.set_footer(text='Use the buttons below to manage this ticket.')
+
+        await ticket_ch.send(content=user.mention, embed=embed, view=TicketControlView())
+
+        log_embed = discord.Embed(title='🎫 Ticket Opened', color=cat_info['color'], timestamp=discord.utils.utcnow())
+        log_embed.add_field(name='User', value=f'{user.mention} (`{user.id}`)', inline=True)
+        log_embed.add_field(name='Type', value=cat_info['label'], inline=True)
+        log_embed.add_field(name='Channel', value=ticket_ch.mention, inline=True)
+        await send_log(guild, log_embed)
+
+        await inter.followup.send(embed=success_embed('Ticket Created', f'Your ticket has been opened: {ticket_ch.mention}'), ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketTypeSelect())
+
+
+# ═══════════════════════════════════════════════════════════════
 #  READY
 # ═══════════════════════════════════════════════════════════════
 @bot.event
 async def on_ready():
     print(f'[READY] Logged in as {bot.user}')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='over Sparky AI'))
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketControlView())
     guild_id = os.getenv('GUILD_ID')
     if guild_id:
         g = discord.Object(id=int(guild_id))
@@ -260,8 +475,6 @@ async def on_ready():
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild: return
-
-    # Word filter
     words = get_filter_words(message.guild.id)
     if words and any(w in message.content.lower() for w in words):
         await message.delete()
@@ -269,8 +482,6 @@ async def on_message(message):
         await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
         await m.delete()
         return
-
-    # Anti-spam
     now = time.time()
     uid = message.author.id
     spam_map.setdefault(uid, [])
@@ -289,7 +500,6 @@ async def on_message(message):
                 await m.delete()
             except: pass
         return
-
     await bot.process_commands(message)
 
 
@@ -297,8 +507,6 @@ async def on_message(message):
 async def on_member_join(member):
     cfg = get_config(member.guild.id)
     days = age_days(member)
-
-    # Mod log
     log_id = cfg.get('logsChannelId')
     if log_id:
         ch = member.guild.get_channel(int(log_id))
@@ -316,14 +524,11 @@ async def on_member_join(member):
             if days < 7: e.description = '⚠️ **Account less than 7 days old!**'
             try: await ch.send(embed=e)
             except: pass
-
-    # Welcome channel — auto-finds #welcome or uses configured override
     welcome_ch = discord.utils.get(member.guild.text_channels, name='welcome')
     if not welcome_ch:
         wid = cfg.get('welcomeChannelId')
         if wid: welcome_ch = member.guild.get_channel(int(wid))
     if not welcome_ch: return
-
     e = discord.Embed(
         title=f'🎉 Welcome to {member.guild.name}!',
         description=(
@@ -415,7 +620,7 @@ async def _warnings(ctx_or_inter, target: discord.Member):
     if not ws: return await do_reply(ctx_or_inter, embed=info_embed('No Warnings', f'{target} has no warnings.'))
     lines = []
     for i, w in enumerate(ws):
-        ts = int(datetime.datetime.fromisoformat(w['timestamp'].replace('Z','+00:00')).timestamp())
+        ts = int(datetime.datetime.fromisoformat(w['timestamp'].replace('Z', '+00:00')).timestamp())
         lines.append(f'**#{i+1}** • <t:{ts}:R>\n> {w["reason"]}\n> by <@{w["moderator_id"]}> • ID: `{w["id"]}`')
     e = discord.Embed(title=f'⚠️ Warnings for {target}', description='\n\n'.join(lines), color=COLORS['warn'])
     e.set_thumbnail(url=target.display_avatar.url)
@@ -672,7 +877,7 @@ async def _usercheck(ctx_or_inter, target: discord.Member):
     e.add_field(name='🏷️ Roles', value=' '.join(roles) if roles else 'None', inline=False)
     warn_lines = '\n'.join([f'• {w["reason"]}' for w in ws[-3:]]) or 'None'
     e.add_field(name=f'⚠️ Warnings ({len(ws)})', value=warn_lines, inline=False)
-    act_lines = '\n'.join([f'• **{a["type"]}** — {a.get("reason","")[:40]}' for a in acts[-5:]]) or 'None'
+    act_lines = '\n'.join([f'• **{a["type"]}** — {a.get("reason", "")[:40]}' for a in acts[-5:]]) or 'None'
     e.add_field(name=f'🔨 Actions ({len(acts)})', value=act_lines, inline=False)
     alts = [m for m in guild.members if m.id != target.id and abs((m.created_at - target.created_at).total_seconds()) < 86400]
     if alts: e.add_field(name='🔁 Possible Alts', value='\n'.join(str(a) for a in alts[:10]), inline=False)
@@ -995,7 +1200,7 @@ async def filter_add_slash(inter: discord.Interaction, word: str):
     if not is_mod(inter.guild.get_member(inter.user.id)):
         return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
     added = add_filter_word(inter.guild.id, word)
-    await do_reply(inter, embed=success_embed('Word Added', f'`{word}` added.') if added else info_embed('Already Filtered', f'`{word}` is already filtered.'))
+    await do_reply(inter, embed=success_embed('Word Added', f'`{word}` added.') if added else info_embed('Already Filtered', f'`{word}` already filtered.'))
 
 @tree.command(name='filter_remove', description='Remove a word from the filter')
 @app_commands.describe(word='Word to remove')
@@ -1017,7 +1222,7 @@ async def filter_list_slash(inter: discord.Interaction):
 # ═══════════════════════════════════════════════════════════════
 #  AVATAR
 # ═══════════════════════════════════════════════════════════════
-async def _avatar(ctx_or_inter, target: discord.Member = None):
+async def _avatar(ctx_or_inter, target=None):
     user = target or (ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user)
     e = discord.Embed(title=f'🖼️ {user}\'s Avatar', color=COLORS['info'])
     e.set_image(url=user.display_avatar.url)
@@ -1049,7 +1254,6 @@ async def _serverinfo(ctx_or_inter):
     e.add_field(name='👥 Members', value=str(guild.member_count), inline=True)
     e.add_field(name='💬 Channels', value=str(len(guild.channels)), inline=True)
     e.add_field(name='🎭 Roles', value=str(len(guild.roles)), inline=True)
-    e.add_field(name='🌍 Locale', value=str(guild.preferred_locale), inline=True)
     e.add_field(name='🆔 Server ID', value=str(guild.id), inline=True)
     if guild.description: e.description = guild.description
     await do_reply(ctx_or_inter, embed=e)
@@ -1128,12 +1332,12 @@ async def _reviewpanel(ctx_or_inter, target: discord.Member):
         btn = discord.ui.Button(label=label, style=style)
         async def callback(interaction: discord.Interaction):
             if not is_mod(interaction.guild.get_member(interaction.user.id)):
-                return await interaction.response.send_message(embed=error_embed('No Permission', 'You need moderation permissions.'), ephemeral=True)
+                return await interaction.response.send_message(embed=error_embed('No Permission', 'Staff only.'), ephemeral=True)
             await interaction.response.defer()
             if action == 'remove':
                 await remove_chatban(interaction.guild, target.id)
                 add_mod_action(interaction.guild.id, target.id, {'type': 'UNCHATBAN', 'moderator_id': str(interaction.user.id), 'reason': 'Review panel'})
-                await interaction.followup.send(embed=success_embed('Chatban Removed', f'{target}\'s chatban has been lifted.'))
+                await interaction.followup.send(embed=success_embed('Chatban Removed', f'{target}\'s chatban lifted.'))
                 await send_log(interaction.guild, mod_embed('Chatban Removed (Panel)', interaction.user, target, 'Review panel'))
             elif action == 'increase':
                 existing = get_chatban(interaction.guild.id, target.id)
@@ -1158,7 +1362,6 @@ async def _reviewpanel(ctx_or_inter, target: discord.Member):
     await make_button('⬇ Decrease Ban', discord.ButtonStyle.primary, 'decrease')
     await make_button('🔓 Remove Ban', discord.ButtonStyle.success, 'remove')
     await make_button('✅ Keep As-Is', discord.ButtonStyle.secondary, 'keep')
-
     await do_reply(ctx_or_inter, embed=e, view=view)
 
 @bot.command(name='reviewpanel', aliases=['cbpanel', 'cbr'])
@@ -1173,6 +1376,43 @@ async def reviewpanel_slash(inter: discord.Interaction, user: discord.Member):
     await _reviewpanel(inter, user)
 
 # ═══════════════════════════════════════════════════════════════
+#  TICKET PANEL COMMAND
+# ═══════════════════════════════════════════════════════════════
+async def _ticketpanel(ctx_or_inter, channel: discord.TextChannel = None):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
+    target_ch = channel or ctx_or_inter.channel
+    e = discord.Embed(
+        title='🎫 Sparky AI Support',
+        description=(
+            'Need help? Want to buy Sparky AI? Have a question?\n\n'
+            '**Select a category below to open a ticket.**\n\n'
+            '🛠️ **Support** — Technical issues and troubleshooting\n'
+            '💳 **Buy Sparky AI** — Purchase enquiries and plans\n'
+            '💬 **General Question** — Anything else\n\n'
+            '*A staff member will assist you as soon as possible.*'
+        ),
+        color=0x5865F2
+    )
+    e.set_footer(text='Sparky AI • Support System')
+    if ctx_or_inter.guild.icon:
+        e.set_thumbnail(url=ctx_or_inter.guild.icon.url)
+    await target_ch.send(embed=e, view=TicketPanelView())
+    if target_ch != ctx_or_inter.channel:
+        await do_reply(ctx_or_inter, embed=success_embed('Panel Sent', f'Ticket panel posted in {target_ch.mention}.'))
+
+@bot.command(name='ticketpanel', aliases=['tp', 'tickets'])
+async def ticketpanel_cmd(ctx, channel: discord.TextChannel = None):
+    await _ticketpanel(ctx, channel)
+
+@tree.command(name='ticketpanel', description='Post the ticket panel in a channel')
+@app_commands.describe(channel='Channel to post the panel in (defaults to current)')
+async def ticketpanel_slash(inter: discord.Interaction, channel: discord.TextChannel = None):
+    await inter.response.defer()
+    await _ticketpanel(inter, channel)
+
+# ═══════════════════════════════════════════════════════════════
 #  HELP
 # ═══════════════════════════════════════════════════════════════
 async def _help(ctx_or_inter):
@@ -1185,6 +1425,7 @@ async def _help(ctx_or_inter):
     e.add_field(name='📢 Channels', value='`lock` `unlock` `lockdown` `unlockall` `nuke`', inline=True)
     e.add_field(name='🛠️ User Mgmt', value='`nickname` `role` `slowmode` `purge`', inline=True)
     e.add_field(name='🚫 Filter', value='`filter add/remove/list`', inline=True)
+    e.add_field(name='🎫 Tickets', value='`ticketpanel [#channel]`', inline=True)
     e.add_field(name='⚙️ Config', value='`logschannel` `welcomechannel` `reviewpanel`', inline=True)
     e.set_footer(text='Duration format: 10s, 10m, 1h, 2d, 1w')
     await do_reply(ctx_or_inter, embed=e)
