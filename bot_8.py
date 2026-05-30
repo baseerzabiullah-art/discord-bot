@@ -773,10 +773,10 @@ async def on_member_join(member):
     e.add_field(name='👤 Member', value=str(member), inline=True)
     e.add_field(name='🔢 Member #', value=str(member.guild.member_count), inline=True)
     e.add_field(name='📅 Account Age', value=f'{days} days', inline=True)
-    e.set_image(url=WELCOME_GIF)
     e.set_footer(text=f'You are our {member.guild.member_count}th member! 🥳', icon_url=member.guild.icon.url if member.guild.icon else None)
     try:
         await welcome_ch.send(content=f'🎊 Welcome to the server, {member.mention}! We\'ve been expecting you.', embed=e)
+        await welcome_ch.send(WELCOME_GIF)
     except: pass
 
 
@@ -1281,7 +1281,8 @@ async def _nuke(ctx_or_inter):
         new_ch = await ch.clone(reason=f'Nuked by {mod}')
         await new_ch.edit(position=ch.position)
         await ch.delete(reason=f'Nuked by {mod}')
-        await new_ch.send(embed=success_embed('Channel Nuked', '💣 Channel has been nuked and recreated. RIP to every message that didn\'t make it out alive. Thoughts and prayers. 🕯️').set_image(url='https://media1.tenor.com/m/qufV4aucOi8AAAAC/pocoyo-dance.gif'))
+        await new_ch.send(embed=success_embed('Channel Nuked', '💣 Channel has been nuked and recreated. RIP to every message that didn\'t make it out alive. Thoughts and prayers. 🕯️'))
+        await new_ch.send('https://media1.tenor.com/m/qufV4aucOi8AAAAC/pocoyo-dance.gif')
         await send_log(ctx_or_inter.guild, mod_embed('Channel Nuked', mod, ch, 'Nuke command'))
     except Exception as ex:
         await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
