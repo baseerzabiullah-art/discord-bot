@@ -205,6 +205,202 @@ def remove_reminder(rid):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════
+def _now():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+COLORS = {'success': 0x57F287, 'error': 0xED4245, 'warn': 0xFEE75C, 'info': 0x5865F2, 'mod': 0xEB459E}
+
+def success_embed(title, desc):
+    return discord.Embed(title=f'✅ {title}', description=desc, color=COLORS['success'])
+
+def error_embed(title, desc):
+    return discord.Embed(title=f'❌ {title}', description=desc, color=COLORS['error'])
+
+def warn_embed(title, desc):
+    return discord.Embed(title=f'⚠️ {title}', description=desc, color=COLORS['warn'])
+
+def info_embed(title, desc):
+    return discord.Embed(title=f'ℹ️ {title}', description=desc, color=COLORS['info'])
+
+def mod_embed(action, moderator, target, reason, extra=None):
+    e = discord.Embed(title=f'🔨 {action}', color=COLORS['mod'], timestamp=discord.utils.utcnow())
+    e.add_field(name='Target', value=f'{target} (`{getattr(target, "id", target)}`)', inline=True)
+    e.add_field(name='Moderator', value=str(moderator), inline=True)
+    e.add_field(name='Reason', value=reason or 'No reason provided', inline=False)
+    if extra:
+        for k, v in extra.items(): e.add_field(name=k, value=str(v), inline=True)
+    return e
+
+def is_mod(member):
+    p = member.guild_permissions
+    return any([p.moderate_members, p.ban_members, p.kick_members, p.administrator])
+
+def is_admin(member):
+    return member.guild_permissions.administrator or member.guild_permissions.manage_guild
+
+def age_days(user):
+    return (discord.utils.utcnow() - user.created_at).days
+
+def parse_duration(s):
+    units = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+    if not s or s[-1] not in units: return None
+    try:
+        v = int(s[:-1])
+        secs = v * units[s[-1]]
+        return secs if secs <= 28*86400 else None
+    except: return None
+
+async def send_log(guild, embed):
+    cfg = get_config(guild.id)
+    ch_id = cfg.get('logsChannelId')
+    if ch_id:
+        ch = guild.get_channel(int(ch_id))
+        if ch:
+            try: await ch.send(embed=embed)
+            except: pass
+
+async def do_reply(ctx_or_inter, **kwargs):
+    if isinstance(ctx_or_inter, commands.Context):
+        await ctx_or_inter.reply(**kwargs)
+    else:
+        kwargs.setdefault('ephemeral', True)
+        if ctx_or_inter.response.is_done():
+            await ctx_or_inter.followup.send(**kwargs)
+        else:
+            await ctx_or_inter.response.send_message(**kwargs)
+
+async def apply_chatban(guild, user_id, reason, mod_id, duration_secs=None):
+    member = guild.get_member(int(user_id))
+    if not member: return False
+    for ch in guild.text_channels:
+        try:
+            await ch.set_permissions(member, send_messages=False, add_reactions=False,
+                                     create_public_threads=False, create_private_threads=False,
+                                     send_messages_in_threads=False)
+        except: pass
+    set_chatban(guild.id, user_id, {
+        'moderator_id': str(mod_id), 'reason': reason, 'applied_at': _now(),
+        'expires_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + duration_secs)) if duration_secs else None
+    })
+    return True
+
+async def remove_chatban(guild, user_id):
+    member = guild.get_member(int(user_id))
+    if member:
+        for ch in guild.text_channels:
+            try:
+                ow = ch.overwrites_for(member)
+                ow.send_messages = None
+                ow.add_reactions = None
+                ow.create_public_threads = None
+                ow.create_private_threads = None
+                ow.send_messages_in_threads = None
+                if ow.is_empty():
+                    await ch.set_permissions(member, overwrite=None)
+                else:
+                    await ch.set_permissions(member, overwrite=ow)
+            except: pass
+    del_chatban(guild.id, user_id)
+
+# ═══════════════════════════════════════════════════════════════
+#  TRANSCRIPT HELPER
+# ═══════════════════════════════════════════════════════════════
+async def send_transcript(guild, ticket_channel, ticket_data):
+    """Collect all messages from ticket channel and post transcript."""
+    cfg = get_config(guild.id)
+    transcript_ch_id = cfg.get('transcriptChannelId')
+    if not transcript_ch_id:
+        return
+
+    transcript_ch = guild.get_channel(int(transcript_ch_id))
+    if not transcript_ch:
+        return
+
+    # Collect messages oldest first
+    messages = []
+    try:
+        async for msg in ticket_channel.history(limit=500, oldest_first=True):
+            if msg.author.bot and not msg.embeds:
+                continue
+            messages.append(msg)
+    except:
+        return
+
+    cat_info = TICKET_CATEGORIES.get(ticket_data.get('type', 'general'), TICKET_CATEGORIES['general'])
+    ticket_number = ticket_data.get('number', '?')
+    opener_id = ticket_data.get('user_id', '?')
+    opened_at = ticket_data.get('opened_at', 'Unknown')
+    closed_at = ticket_data.get('closed_at', _now())
+    closed_by_id = ticket_data.get('closed_by', '?')
+
+    # Build transcript text
+    lines = []
+    lines.append(f'TICKET TRANSCRIPT — #{ticket_number:04d}' if isinstance(ticket_number, int) else f'TICKET TRANSCRIPT — #{ticket_number}')
+    lines.append(f'Type     : {cat_info["label"]}')
+    lines.append(f'Opened by: {opener_id}')
+    lines.append(f'Opened at: {opened_at}')
+    lines.append(f'Closed by: {closed_by_id}')
+    lines.append(f'Closed at: {closed_at}')
+    lines.append(f'Messages : {len(messages)}')
+    lines.append('=' * 60)
+    lines.append('')
+
+    for msg in messages:
+        ts = msg.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        content = msg.content or ''
+        if msg.embeds:
+            for emb in msg.embeds:
+                title = emb.title or ''
+                desc = emb.description or ''
+                content += f'[Embed: {title} — {desc[:100]}]'
+        if msg.attachments:
+            for att in msg.attachments:
+                content += f' [Attachment: {att.url}]'
+        lines.append(f'[{ts}] {msg.author.display_name} ({msg.author.id}): {content}')
+
+    transcript_text = '\n'.join(lines)
+
+    # Send as a file attachment if long, otherwise in an embed
+    transcript_embed = discord.Embed(
+        title=f'📋 Ticket Transcript — #{ticket_number:04d}' if isinstance(ticket_number, int) else f'📋 Ticket Transcript — #{ticket_number}',
+        color=cat_info['color'],
+        timestamp=discord.utils.utcnow()
+    )
+    transcript_embed.add_field(name='📋 Type',      value=cat_info['label'],          inline=True)
+    transcript_embed.add_field(name='👤 Opened by', value=f'<@{opener_id}>',          inline=True)
+    transcript_embed.add_field(name='🔒 Closed by', value=f'<@{closed_by_id}>',       inline=True)
+    transcript_embed.add_field(name='📅 Opened',    value=opened_at,                  inline=True)
+    transcript_embed.add_field(name='📅 Closed',    value=closed_at,                  inline=True)
+    transcript_embed.add_field(name='💬 Messages',  value=str(len(messages)),         inline=True)
+    transcript_embed.set_footer(text=f'Channel: {ticket_channel.name}')
+
+    # Send as .txt file attachment
+    import io
+    file = discord.File(
+        fp=io.BytesIO(transcript_text.encode('utf-8')),
+        filename=f'transcript-{ticket_channel.name}.txt'
+    )
+
+    try:
+        await transcript_ch.send(embed=transcript_embed, file=file)
+    except:
+        pass
+
+# ═══════════════════════════════════════════════════════════════
+#  BOT SETUP
+# ═══════════════════════════════════════════════════════════════
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.moderation = True
+
+bot = commands.Bot(command_prefix=PREFIXES, intents=intents, help_command=None)
+tree = bot.tree
+spam_map = {}
+
+# ═══════════════════════════════════════════════════════════════
 #  TEMPBAN
 # ═══════════════════════════════════════════════════════════════
 async def _tempban(ctx_or_inter, target: discord.Member, duration_str: str, reason='No reason provided'):
@@ -428,201 +624,6 @@ async def remind_slash(inter: discord.Interaction, duration: str, text: str):
     await inter.response.defer(ephemeral=True)
     await _remind(inter, duration, text)
 
-# ═══════════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════════
-def _now():
-    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-
-COLORS = {'success': 0x57F287, 'error': 0xED4245, 'warn': 0xFEE75C, 'info': 0x5865F2, 'mod': 0xEB459E}
-
-def success_embed(title, desc):
-    return discord.Embed(title=f'✅ {title}', description=desc, color=COLORS['success'])
-
-def error_embed(title, desc):
-    return discord.Embed(title=f'❌ {title}', description=desc, color=COLORS['error'])
-
-def warn_embed(title, desc):
-    return discord.Embed(title=f'⚠️ {title}', description=desc, color=COLORS['warn'])
-
-def info_embed(title, desc):
-    return discord.Embed(title=f'ℹ️ {title}', description=desc, color=COLORS['info'])
-
-def mod_embed(action, moderator, target, reason, extra=None):
-    e = discord.Embed(title=f'🔨 {action}', color=COLORS['mod'], timestamp=discord.utils.utcnow())
-    e.add_field(name='Target', value=f'{target} (`{getattr(target, "id", target)}`)', inline=True)
-    e.add_field(name='Moderator', value=str(moderator), inline=True)
-    e.add_field(name='Reason', value=reason or 'No reason provided', inline=False)
-    if extra:
-        for k, v in extra.items(): e.add_field(name=k, value=str(v), inline=True)
-    return e
-
-def is_mod(member):
-    p = member.guild_permissions
-    return any([p.moderate_members, p.ban_members, p.kick_members, p.administrator])
-
-def is_admin(member):
-    return member.guild_permissions.administrator or member.guild_permissions.manage_guild
-
-def age_days(user):
-    return (discord.utils.utcnow() - user.created_at).days
-
-def parse_duration(s):
-    units = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
-    if not s or s[-1] not in units: return None
-    try:
-        v = int(s[:-1])
-        secs = v * units[s[-1]]
-        return secs if secs <= 28*86400 else None
-    except: return None
-
-async def send_log(guild, embed):
-    cfg = get_config(guild.id)
-    ch_id = cfg.get('logsChannelId')
-    if ch_id:
-        ch = guild.get_channel(int(ch_id))
-        if ch:
-            try: await ch.send(embed=embed)
-            except: pass
-
-async def do_reply(ctx_or_inter, **kwargs):
-    if isinstance(ctx_or_inter, commands.Context):
-        await ctx_or_inter.reply(**kwargs)
-    else:
-        kwargs.setdefault('ephemeral', True)
-        if ctx_or_inter.response.is_done():
-            await ctx_or_inter.followup.send(**kwargs)
-        else:
-            await ctx_or_inter.response.send_message(**kwargs)
-
-async def apply_chatban(guild, user_id, reason, mod_id, duration_secs=None):
-    member = guild.get_member(int(user_id))
-    if not member: return False
-    for ch in guild.text_channels:
-        try:
-            await ch.set_permissions(member, send_messages=False, add_reactions=False,
-                                     create_public_threads=False, create_private_threads=False,
-                                     send_messages_in_threads=False)
-        except: pass
-    set_chatban(guild.id, user_id, {
-        'moderator_id': str(mod_id), 'reason': reason, 'applied_at': _now(),
-        'expires_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + duration_secs)) if duration_secs else None
-    })
-    return True
-
-async def remove_chatban(guild, user_id):
-    member = guild.get_member(int(user_id))
-    if member:
-        for ch in guild.text_channels:
-            try:
-                ow = ch.overwrites_for(member)
-                ow.send_messages = None
-                ow.add_reactions = None
-                ow.create_public_threads = None
-                ow.create_private_threads = None
-                ow.send_messages_in_threads = None
-                if ow.is_empty():
-                    await ch.set_permissions(member, overwrite=None)
-                else:
-                    await ch.set_permissions(member, overwrite=ow)
-            except: pass
-    del_chatban(guild.id, user_id)
-
-# ═══════════════════════════════════════════════════════════════
-#  TRANSCRIPT HELPER
-# ═══════════════════════════════════════════════════════════════
-async def send_transcript(guild, ticket_channel, ticket_data):
-    """Collect all messages from ticket channel and post transcript."""
-    cfg = get_config(guild.id)
-    transcript_ch_id = cfg.get('transcriptChannelId')
-    if not transcript_ch_id:
-        return
-
-    transcript_ch = guild.get_channel(int(transcript_ch_id))
-    if not transcript_ch:
-        return
-
-    # Collect messages oldest first
-    messages = []
-    try:
-        async for msg in ticket_channel.history(limit=500, oldest_first=True):
-            if msg.author.bot and not msg.embeds:
-                continue
-            messages.append(msg)
-    except:
-        return
-
-    cat_info = TICKET_CATEGORIES.get(ticket_data.get('type', 'general'), TICKET_CATEGORIES['general'])
-    ticket_number = ticket_data.get('number', '?')
-    opener_id = ticket_data.get('user_id', '?')
-    opened_at = ticket_data.get('opened_at', 'Unknown')
-    closed_at = ticket_data.get('closed_at', _now())
-    closed_by_id = ticket_data.get('closed_by', '?')
-
-    # Build transcript text
-    lines = []
-    lines.append(f'TICKET TRANSCRIPT — #{ticket_number:04d}' if isinstance(ticket_number, int) else f'TICKET TRANSCRIPT — #{ticket_number}')
-    lines.append(f'Type     : {cat_info["label"]}')
-    lines.append(f'Opened by: {opener_id}')
-    lines.append(f'Opened at: {opened_at}')
-    lines.append(f'Closed by: {closed_by_id}')
-    lines.append(f'Closed at: {closed_at}')
-    lines.append(f'Messages : {len(messages)}')
-    lines.append('=' * 60)
-    lines.append('')
-
-    for msg in messages:
-        ts = msg.created_at.strftime('%Y-%m-%d %H:%M:%S')
-        content = msg.content or ''
-        if msg.embeds:
-            for emb in msg.embeds:
-                title = emb.title or ''
-                desc = emb.description or ''
-                content += f'[Embed: {title} — {desc[:100]}]'
-        if msg.attachments:
-            for att in msg.attachments:
-                content += f' [Attachment: {att.url}]'
-        lines.append(f'[{ts}] {msg.author.display_name} ({msg.author.id}): {content}')
-
-    transcript_text = '\n'.join(lines)
-
-    # Send as a file attachment if long, otherwise in an embed
-    transcript_embed = discord.Embed(
-        title=f'📋 Ticket Transcript — #{ticket_number:04d}' if isinstance(ticket_number, int) else f'📋 Ticket Transcript — #{ticket_number}',
-        color=cat_info['color'],
-        timestamp=discord.utils.utcnow()
-    )
-    transcript_embed.add_field(name='📋 Type',      value=cat_info['label'],          inline=True)
-    transcript_embed.add_field(name='👤 Opened by', value=f'<@{opener_id}>',          inline=True)
-    transcript_embed.add_field(name='🔒 Closed by', value=f'<@{closed_by_id}>',       inline=True)
-    transcript_embed.add_field(name='📅 Opened',    value=opened_at,                  inline=True)
-    transcript_embed.add_field(name='📅 Closed',    value=closed_at,                  inline=True)
-    transcript_embed.add_field(name='💬 Messages',  value=str(len(messages)),         inline=True)
-    transcript_embed.set_footer(text=f'Channel: {ticket_channel.name}')
-
-    # Send as .txt file attachment
-    import io
-    file = discord.File(
-        fp=io.BytesIO(transcript_text.encode('utf-8')),
-        filename=f'transcript-{ticket_channel.name}.txt'
-    )
-
-    try:
-        await transcript_ch.send(embed=transcript_embed, file=file)
-    except:
-        pass
-
-# ═══════════════════════════════════════════════════════════════
-#  BOT SETUP
-# ═══════════════════════════════════════════════════════════════
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-intents.moderation = True
-
-bot = commands.Bot(command_prefix=PREFIXES, intents=intents, help_command=None)
-tree = bot.tree
-spam_map = {}
 
 # ═══════════════════════════════════════════════════════════════
 #  TICKET VIEWS
