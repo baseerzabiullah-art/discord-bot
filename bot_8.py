@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import os, json, time, datetime
+import os, json, time, datetime, asyncio, re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -146,6 +146,288 @@ def delete_ticket_record(guild_id, channel_id):
         del all_data[gid][str(channel_id)]
         _save('tickets.json', all_data)
 
+
+# --- TEMPBANS ---
+def add_tempban(guild_id, user_id, moderator_id, reason, expires_at):
+    data = _load('tempbans.json')
+    data.setdefault(str(guild_id), {})[str(user_id)] = {
+        'moderator_id': str(moderator_id), 'reason': reason,
+        'expires_at': expires_at, 'applied_at': _now()
+    }
+    _save('tempbans.json', data)
+
+def get_tempbans(guild_id):
+    return _load('tempbans.json').get(str(guild_id), {})
+
+def remove_tempban(guild_id, user_id):
+    data = _load('tempbans.json')
+    gid, uid = str(guild_id), str(user_id)
+    if gid in data and uid in data[gid]:
+        del data[gid][uid]
+        _save('tempbans.json', data)
+
+# --- STICKY MESSAGES ---
+def get_sticky(guild_id, channel_id):
+    return _load('sticky.json').get(str(guild_id), {}).get(str(channel_id))
+
+def set_sticky(guild_id, channel_id, text, message_id=None):
+    data = _load('sticky.json')
+    data.setdefault(str(guild_id), {})[str(channel_id)] = {'text': text, 'message_id': message_id}
+    _save('sticky.json', data)
+
+def del_sticky(guild_id, channel_id):
+    data = _load('sticky.json')
+    gid, cid = str(guild_id), str(channel_id)
+    if gid in data and cid in data[gid]:
+        del data[gid][cid]
+        _save('sticky.json', data)
+
+def get_all_stickies(guild_id):
+    return _load('sticky.json').get(str(guild_id), {})
+
+# --- REMINDERS ---
+def add_reminder(user_id, guild_id, channel_id, text, fire_at):
+    data = _load('reminders.json')
+    rid = str(int(time.time() * 1000))
+    data[rid] = {'user_id': str(user_id), 'guild_id': str(guild_id),
+                 'channel_id': str(channel_id), 'text': text, 'fire_at': fire_at}
+    _save('reminders.json', data)
+    return rid
+
+def get_all_reminders():
+    return _load('reminders.json')
+
+def remove_reminder(rid):
+    data = _load('reminders.json')
+    if rid in data:
+        del data[rid]
+        _save('reminders.json', data)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TEMPBAN
+# ═══════════════════════════════════════════════════════════════
+async def _tempban(ctx_or_inter, target: discord.Member, duration_str: str, reason='No reason provided'):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not guild.get_member(mod.id).guild_permissions.ban_members:
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Ban Members permission.'))
+    secs = parse_duration(duration_str)
+    if not secs: return await do_reply(ctx_or_inter, embed=error_embed('Invalid Duration', 'Use: 10m, 1h, 2d, 1w (max 28d)'))
+    expires_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + secs))
+    try: await guild.ban(target, reason=f'Tempban ({duration_str}): {reason}', delete_message_days=0)
+    except Exception as ex: return await do_reply(ctx_or_inter, embed=error_embed('Failed', str(ex)))
+    add_tempban(guild.id, target.id, mod.id, reason, expires_at)
+    add_mod_action(guild.id, target.id, {'type': 'TEMPBAN', 'moderator_id': str(mod.id), 'reason': reason, 'duration': duration_str, 'expires_at': expires_at})
+    e = mod_embed('Member Temp-Banned', mod, target, reason, {'Duration': duration_str, 'Expires': expires_at})
+    await send_log(guild, e)
+    await do_reply(ctx_or_inter, embed=e)
+    try: await target.send(embed=warn_embed('Temp Banned', f'You have been temporarily banned from **{guild.name}** for **{duration_str}**. Reason: {reason}'))
+    except: pass
+
+@bot.command(name='tempban', aliases=['tban'])
+async def tempban_cmd(ctx, target: discord.Member = None, duration: str = None, *, reason='No reason provided'):
+    if not target or not duration: return await ctx.reply(embed=error_embed('Usage', '.tempban <user> <duration> [reason]'))
+    await _tempban(ctx, target, duration, reason)
+
+@tree.command(name='tempban', description='Temporarily ban a user')
+@app_commands.describe(user='User to ban', duration='Duration (10m, 1h, 2d)', reason='Reason')
+async def tempban_slash(inter: discord.Interaction, user: discord.Member, duration: str, reason: str = 'No reason provided'):
+    await inter.response.defer(ephemeral=True)
+    await _tempban(inter, user, duration, reason)
+
+# ═══════════════════════════════════════════════════════════════
+#  WARN EXPIRY
+# ═══════════════════════════════════════════════════════════════
+async def _clearexpired(ctx_or_inter, target: discord.Member, days: int = 30):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    data = _load('warnings.json')
+    gid, uid = str(ctx_or_inter.guild.id), str(target.id)
+    if gid not in data or uid not in data[gid]:
+        return await do_reply(ctx_or_inter, embed=info_embed('No Warnings', f'{target} has no warnings.'))
+    cutoff = time.time() - (days * 86400)
+    before = len(data[gid][uid])
+    data[gid][uid] = [w for w in data[gid][uid]
+                      if datetime.datetime.fromisoformat(w['timestamp'].replace('Z','+00:00')).timestamp() > cutoff]
+    removed = before - len(data[gid][uid])
+    _save('warnings.json', data)
+    await do_reply(ctx_or_inter, embed=success_embed('Warnings Cleared', f'Removed **{removed}** warning(s) older than **{days} days** from {target}.'))
+
+@bot.command(name='clearexpired', aliases=['expirewarn'])
+async def clearexpired_cmd(ctx, target: discord.Member = None, days: int = 30):
+    if not target: return await ctx.reply(embed=error_embed('Usage', '.clearexpired <user> [days=30]'))
+    await _clearexpired(ctx, target, days)
+
+@tree.command(name='clearexpired', description='Remove warnings older than X days from a user')
+@app_commands.describe(user='User', days='Warnings older than this many days will be removed (default 30)')
+async def clearexpired_slash(inter: discord.Interaction, user: discord.Member, days: int = 30):
+    await inter.response.defer(ephemeral=True)
+    await _clearexpired(inter, user, days)
+
+# ═══════════════════════════════════════════════════════════════
+#  MOD STATS
+# ═══════════════════════════════════════════════════════════════
+async def _modstats(ctx_or_inter, target: discord.Member = None):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    subject = target or mod
+    guild = ctx_or_inter.guild
+    all_actions = _load('modactions.json').get(str(guild.id), {})
+    counts = {}
+    for uid_actions in all_actions.values():
+        for action in uid_actions:
+            if str(action.get('moderator_id')) == str(subject.id):
+                t = action.get('type', 'UNKNOWN')
+                counts[t] = counts.get(t, 0) + 1
+    total = sum(counts.values())
+    e = discord.Embed(title=f'📊 Mod Stats — {subject}', color=COLORS['mod'], timestamp=discord.utils.utcnow())
+    e.set_thumbnail(url=subject.display_avatar.url)
+    if counts:
+        stats_lines = '\n'.join(f'**{k}:** {v}' for k, v in sorted(counts.items(), key=lambda x: -x[1]))
+        e.add_field(name='Actions Taken', value=stats_lines, inline=False)
+        e.add_field(name='Total', value=str(total), inline=True)
+    else:
+        e.description = f'{subject.mention} has not taken any moderation actions yet.'
+    await do_reply(ctx_or_inter, embed=e)
+
+@bot.command(name='modstats', aliases=['ms'])
+async def modstats_cmd(ctx, target: discord.Member = None):
+    await _modstats(ctx, target)
+
+@tree.command(name='modstats', description='View moderation action stats for a moderator')
+@app_commands.describe(user='Moderator to check (defaults to yourself)')
+async def modstats_slash(inter: discord.Interaction, user: discord.Member = None):
+    await inter.response.defer(ephemeral=True)
+    await _modstats(inter, user)
+
+# ═══════════════════════════════════════════════════════════════
+#  TICKET STATS
+# ═══════════════════════════════════════════════════════════════
+async def _ticketstats(ctx_or_inter):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    all_tickets = get_tickets(ctx_or_inter.guild.id)
+    total = len(all_tickets)
+    open_t = sum(1 for t in all_tickets.values() if t.get('open'))
+    closed_t = total - open_t
+    by_type = {}
+    for t in all_tickets.values():
+        k = t.get('type', 'unknown')
+        by_type[k] = by_type.get(k, 0) + 1
+    claimed = sum(1 for t in all_tickets.values() if t.get('claimed_by'))
+    e = discord.Embed(title='🎫 Ticket Statistics', color=COLORS['info'], timestamp=discord.utils.utcnow())
+    e.add_field(name='📊 Total Tickets', value=str(total), inline=True)
+    e.add_field(name='🟢 Open', value=str(open_t), inline=True)
+    e.add_field(name='🔴 Closed', value=str(closed_t), inline=True)
+    e.add_field(name='✋ Claimed', value=str(claimed), inline=True)
+    if by_type:
+        type_lines = '\n'.join(f'**{TICKET_CATEGORIES.get(k, {}).get("label", k)}:** {v}' for k, v in by_type.items())
+        e.add_field(name='By Type', value=type_lines, inline=False)
+    await do_reply(ctx_or_inter, embed=e)
+
+@bot.command(name='ticketstats', aliases=['tstats'])
+async def ticketstats_cmd(ctx):
+    await _ticketstats(ctx)
+
+@tree.command(name='ticketstats', description='View ticket statistics')
+async def ticketstats_slash(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    await _ticketstats(inter)
+
+# ═══════════════════════════════════════════════════════════════
+#  ASSIGN TICKET
+# ═══════════════════════════════════════════════════════════════
+async def _assignticket(ctx_or_inter, staff: discord.Member):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    channel = ctx_or_inter.channel
+    ticket_data = get_tickets(ctx_or_inter.guild.id).get(str(channel.id))
+    if not ticket_data:
+        return await do_reply(ctx_or_inter, embed=error_embed('Not a Ticket', 'This command must be used inside a ticket channel.'))
+    ticket_data['claimed_by'] = str(staff.id)
+    save_ticket(ctx_or_inter.guild.id, channel.id, ticket_data)
+    await channel.set_permissions(staff, view_channel=True, send_messages=True, read_message_history=True)
+    e = success_embed('Ticket Assigned', f'This ticket has been assigned to {staff.mention} by {mod.mention}.')
+    await do_reply(ctx_or_inter, embed=e)
+    await send_log(ctx_or_inter.guild, discord.Embed(
+        title='🎫 Ticket Assigned', color=COLORS['mod'], timestamp=discord.utils.utcnow()
+    ).add_field(name='Channel', value=channel.mention, inline=True
+    ).add_field(name='Assigned to', value=staff.mention, inline=True
+    ).add_field(name='By', value=mod.mention, inline=True))
+    try: await staff.send(embed=info_embed('Ticket Assigned to You', f'You have been assigned to ticket {channel.mention} in **{ctx_or_inter.guild.name}**.'))
+    except: pass
+
+@bot.command(name='assignticket', aliases=['assign'])
+async def assignticket_cmd(ctx, staff: discord.Member = None):
+    if not staff: return await ctx.reply(embed=error_embed('Usage', '.assignticket <staff member>'))
+    await _assignticket(ctx, staff)
+
+@tree.command(name='assignticket', description='Assign a ticket to a specific staff member')
+@app_commands.describe(staff='Staff member to assign this ticket to')
+async def assignticket_slash(inter: discord.Interaction, staff: discord.Member):
+    await inter.response.defer(ephemeral=True)
+    await _assignticket(inter, staff)
+
+# ═══════════════════════════════════════════════════════════════
+#  STICKY MESSAGES
+# ═══════════════════════════════════════════════════════════════
+async def _sticky(ctx_or_inter, text: str = None):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    channel = ctx_or_inter.channel
+    if not text:
+        del_sticky(ctx_or_inter.guild.id, channel.id)
+        return await do_reply(ctx_or_inter, embed=success_embed('Sticky Removed', f'Sticky message removed from {channel.mention}.'))
+    # Delete old sticky if exists
+    existing = get_sticky(ctx_or_inter.guild.id, channel.id)
+    if existing and existing.get('message_id'):
+        try:
+            old = await channel.fetch_message(int(existing['message_id']))
+            await old.delete()
+        except: pass
+    sticky_msg = await channel.send(embed=discord.Embed(description=f'📌 {text}', color=0xFEE75C))
+    set_sticky(ctx_or_inter.guild.id, channel.id, text, sticky_msg.id)
+    await do_reply(ctx_or_inter, embed=success_embed('Sticky Set', f'Sticky message set in {channel.mention}.'))
+
+@bot.command(name='sticky')
+async def sticky_cmd(ctx, *, text: str = None):
+    await _sticky(ctx, text)
+
+@tree.command(name='sticky', description='Set a sticky message in this channel (omit text to remove)')
+@app_commands.describe(text='The sticky message text (leave blank to remove sticky)')
+async def sticky_slash(inter: discord.Interaction, text: str = None):
+    await inter.response.defer(ephemeral=True)
+    await _sticky(inter, text)
+
+# ═══════════════════════════════════════════════════════════════
+#  REMINDERS
+# ═══════════════════════════════════════════════════════════════
+async def _remind(ctx_or_inter, duration_str: str, text: str):
+    user = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    channel = ctx_or_inter.channel
+    secs = parse_duration(duration_str)
+    if not secs: return await do_reply(ctx_or_inter, embed=error_embed('Invalid Duration', 'Use: 10m, 1h, 2d, 1w (max 28d)'))
+    fire_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + secs))
+    rid = add_reminder(user.id, ctx_or_inter.guild.id, channel.id, text, fire_at)
+    await do_reply(ctx_or_inter, embed=success_embed('Reminder Set', f"I'll remind you in **{duration_str}**: {text}\n\nID: `{rid}`"))
+
+@bot.command(name='remind', aliases=['reminder', 'remindme'])
+async def remind_cmd(ctx, duration: str = None, *, text: str = None):
+    if not duration or not text: return await ctx.reply(embed=error_embed('Usage', '.remind <duration> <text>'))
+    await _remind(ctx, duration, text)
+
+@tree.command(name='remind', description='Set a reminder')
+@app_commands.describe(duration='When to remind you (10m, 1h, 2d)', text='What to remind you about')
+async def remind_slash(inter: discord.Interaction, duration: str, text: str):
+    await inter.response.defer(ephemeral=True)
+    await _remind(inter, duration, text)
+
 # ═══════════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════
@@ -207,6 +489,7 @@ async def do_reply(ctx_or_inter, **kwargs):
     if isinstance(ctx_or_inter, commands.Context):
         await ctx_or_inter.reply(**kwargs)
     else:
+        kwargs.setdefault('ephemeral', True)
         if ctx_or_inter.response.is_done():
             await ctx_or_inter.followup.send(**kwargs)
         else:
@@ -696,6 +979,9 @@ async def on_ready():
     else:
         await tree.sync()
         print('[DEPLOY] Global slash commands synced')
+    # Start background tasks
+    check_tempbans.start()
+    check_reminders.start()
     print('[READY] Bot is fully operational.')
 
 # ═══════════════════════════════════════════════════════════════
@@ -729,6 +1015,18 @@ async def on_message(message):
                 await m.delete()
             except: pass
         return
+    # Sticky message handler
+    sticky = get_sticky(message.guild.id, message.channel.id)
+    if sticky and not message.author.bot:
+        old_msg_id = sticky.get('message_id')
+        if old_msg_id:
+            try:
+                old_msg = await message.channel.fetch_message(int(old_msg_id))
+                await old_msg.delete()
+            except: pass
+        new_sticky = await message.channel.send(embed=discord.Embed(description=f'📌 {sticky["text"]}', color=0xFEE75C))
+        set_sticky(message.guild.id, message.channel.id, sticky['text'], new_sticky.id)
+
     await bot.process_commands(message)
 
 
@@ -779,6 +1077,25 @@ async def on_member_join(member):
         await welcome_ch.send(content=f'🎊 Welcome to the server, {member.mention}! We\'ve been expecting you.', embed=e)
     except: pass
 
+    # Alt detection — alert mods if another account was created within 24h of this one
+    alts = [m for m in member.guild.members if m.id != member.id and
+            abs((m.created_at - member.created_at).total_seconds()) < 86400]
+    if alts and log_id:
+        log_ch = member.guild.get_channel(int(log_id))
+        if log_ch:
+            alt_list = '\n'.join(f'• {a} (`{a.id}`) — created {age_days(a)} days ago' for a in alts[:10])
+            ae = discord.Embed(
+                title='🔁 Possible Alt Account Detected',
+                description=f'{member.mention} (`{member.id}`) just joined and may be an alt of:',
+                color=0xFEE75C, timestamp=discord.utils.utcnow()
+            )
+            ae.add_field(name='Possible Alts', value=alt_list, inline=False)
+            ae.add_field(name='Account Age', value=f'{days} days', inline=True)
+            ae.set_thumbnail(url=member.display_avatar.url)
+            ae.set_footer(text='Accounts created within 24h of each other')
+            try: await log_ch.send(embed=ae)
+            except: pass
+
 
 @bot.event
 async def on_member_remove(member):
@@ -793,6 +1110,65 @@ async def on_member_remove(member):
     e.add_field(name='Members', value=str(member.guild.member_count), inline=True)
     try: await ch.send(embed=e)
     except: pass
+
+
+@bot.event
+async def on_message_edit(before, after):
+    if before.author.bot or not before.guild: return
+    if before.content == after.content: return
+    cfg = get_config(before.guild.id)
+    ch_id = cfg.get('logsChannelId')
+    if not ch_id: return
+    ch = before.guild.get_channel(int(ch_id))
+    if not ch: return
+    e = discord.Embed(title='✏️ Message Edited', color=0x5865F2, timestamp=discord.utils.utcnow())
+    e.set_author(name=str(before.author), icon_url=before.author.display_avatar.url)
+    e.add_field(name='Channel', value=before.channel.mention, inline=True)
+    e.add_field(name='Author', value=f'{before.author.mention} (`{before.author.id}`)', inline=True)
+    e.add_field(name='Before', value=before.content[:1024] or '*empty*', inline=False)
+    e.add_field(name='After', value=after.content[:1024] or '*empty*', inline=False)
+    e.add_field(name='Jump', value=f'[Click to view]({after.jump_url})', inline=True)
+    try: await ch.send(embed=e)
+    except: pass
+
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or not message.guild: return
+    cfg = get_config(message.guild.id)
+    ch_id = cfg.get('logsChannelId')
+    if not ch_id: return
+    ch = message.guild.get_channel(int(ch_id))
+    if not ch: return
+    e = discord.Embed(title='🗑️ Message Deleted', color=0xED4245, timestamp=discord.utils.utcnow())
+    e.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
+    e.add_field(name='Channel', value=message.channel.mention, inline=True)
+    e.add_field(name='Author', value=f'{message.author.mention} (`{message.author.id}`)', inline=True)
+    e.add_field(name='Content', value=message.content[:1024] or '*empty / attachment*', inline=False)
+    try: await ch.send(embed=e)
+    except: pass
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    cfg = get_config(member.guild.id)
+    ch_id = cfg.get('logsChannelId')
+    if not ch_id: return
+    ch = member.guild.get_channel(int(ch_id))
+    if not ch: return
+    if before.channel == after.channel: return
+    if after.channel and not before.channel:
+        desc = f'{member.mention} joined **{after.channel.name}**'
+        color = 0x57F287
+    elif before.channel and not after.channel:
+        desc = f'{member.mention} left **{before.channel.name}**'
+        color = 0xED4245
+    else:
+        desc = f'{member.mention} moved from **{before.channel.name}** → **{after.channel.name}**'
+        color = 0xFEE75C
+    e = discord.Embed(title='🔊 Voice Activity', description=desc, color=color, timestamp=discord.utils.utcnow())
+    e.set_thumbnail(url=member.display_avatar.url)
+    try: await ch.send(embed=e)
+    except: pass
+
 
 # ═══════════════════════════════════════════════════════════════
 #  WARN
@@ -835,7 +1211,7 @@ async def warn_cmd(ctx, target: discord.Member = None, *, reason='No reason prov
 @tree.command(name='warn', description='Warn a user')
 @app_commands.describe(user='User to warn', reason='Reason')
 async def warn_slash(inter: discord.Interaction, user: discord.Member, reason: str = 'No reason provided'):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _warn(inter, user, reason)
 
 # ═══════════════════════════════════════════════════════════════
@@ -864,7 +1240,7 @@ async def warnings_cmd(ctx, target: discord.Member = None):
 @tree.command(name='warnings', description='View warnings for a user')
 @app_commands.describe(user='User to check')
 async def warnings_slash(inter: discord.Interaction, user: discord.Member):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _warnings(inter, user)
 
 # ═══════════════════════════════════════════════════════════════
@@ -885,7 +1261,7 @@ async def delwarn_cmd(ctx, target: discord.Member = None, warning_id: int = None
 @tree.command(name='delwarn', description='Delete a warning')
 @app_commands.describe(user='User', warning_id='Warning ID')
 async def delwarn_slash(inter: discord.Interaction, user: discord.Member, warning_id: int):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _delwarn(inter, user, warning_id)
 
 # ═══════════════════════════════════════════════════════════════
@@ -912,7 +1288,7 @@ async def chatban_cmd(ctx, target: discord.Member = None, *, reason='No reason p
 @tree.command(name='chatban', description='Chatban a user from all channels')
 @app_commands.describe(user='User to chatban', reason='Reason')
 async def chatban_slash(inter: discord.Interaction, user: discord.Member, reason: str = 'No reason provided'):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _chatban(inter, user, reason)
 
 # ═══════════════════════════════════════════════════════════════
@@ -937,7 +1313,7 @@ async def unchatban_cmd(ctx, target: discord.Member = None):
 @tree.command(name='unchatban', description='Remove a chatban')
 @app_commands.describe(user='User to unchatban')
 async def unchatban_slash(inter: discord.Interaction, user: discord.Member):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _unchatban(inter, user)
 
 # ═══════════════════════════════════════════════════════════════
@@ -967,7 +1343,7 @@ async def mute_cmd(ctx, target: discord.Member = None, duration: str = '10m', *,
 @tree.command(name='mute', description='Timeout/mute a user')
 @app_commands.describe(user='User to mute', duration='Duration (10m, 1h, 2d)', reason='Reason')
 async def mute_slash(inter: discord.Interaction, user: discord.Member, duration: str, reason: str = 'No reason provided'):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _mute(inter, user, duration, reason)
 
 # ═══════════════════════════════════════════════════════════════
@@ -992,7 +1368,7 @@ async def unmute_cmd(ctx, target: discord.Member = None):
 @tree.command(name='unmute', description='Remove a timeout')
 @app_commands.describe(user='User to unmute')
 async def unmute_slash(inter: discord.Interaction, user: discord.Member):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _unmute(inter, user)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1018,7 +1394,7 @@ async def kick_cmd(ctx, target: discord.Member = None, *, reason='No reason prov
 @tree.command(name='kick', description='Kick a member')
 @app_commands.describe(user='User to kick', reason='Reason')
 async def kick_slash(inter: discord.Interaction, user: discord.Member, reason: str = 'No reason provided'):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _kick(inter, user, reason)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1053,7 +1429,7 @@ async def ban_cmd(ctx, target: discord.Member = None, *, reason='No reason provi
 @tree.command(name='ban', description='Ban a user')
 @app_commands.describe(user='User to ban', reason='Reason')
 async def ban_slash(inter: discord.Interaction, user: discord.Member, reason: str = 'No reason provided'):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _ban(inter, user, reason)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1081,7 +1457,7 @@ async def unban_cmd(ctx, user_id: int = None, *, reason='No reason provided'):
 @tree.command(name='unban', description='Unban a user by ID')
 @app_commands.describe(user_id='User ID to unban', reason='Reason')
 async def unban_slash(inter: discord.Interaction, user_id: str, reason: str = 'No reason provided'):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     try: await _unban(inter, int(user_id), reason)
     except: await do_reply(inter, embed=error_embed('Invalid ID', 'Provide a valid user ID.'))
 
@@ -1119,7 +1495,7 @@ async def usercheck_cmd(ctx, target: discord.Member = None):
 @tree.command(name='usercheck', description='View user info and mod history')
 @app_commands.describe(user='User to check')
 async def usercheck_slash(inter: discord.Interaction, user: discord.Member):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _usercheck(inter, user)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1150,7 +1526,7 @@ async def note_cmd(ctx, target: discord.Member = None, *, text=None):
 @tree.command(name='note', description='Add a private mod note')
 @app_commands.describe(user='User', text='Note text')
 async def note_slash(inter: discord.Interaction, user: discord.Member, text: str):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _note(inter, user, text)
 
 @bot.command(name='notes')
@@ -1161,7 +1537,7 @@ async def notes_cmd(ctx, target: discord.Member = None):
 @tree.command(name='notes', description='View notes for a user')
 @app_commands.describe(user='User')
 async def notes_slash(inter: discord.Interaction, user: discord.Member):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _notes(inter, user)
 
 @bot.command(name='delnote')
@@ -1174,7 +1550,7 @@ async def delnote_cmd(ctx, target: discord.Member = None, note_id: int = None):
 @tree.command(name='delnote', description='Delete a note')
 @app_commands.describe(user='User', note_id='Note ID')
 async def delnote_slash(inter: discord.Interaction, user: discord.Member, note_id: int):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     if not is_mod(inter.guild.get_member(inter.user.id)):
         return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
     removed = remove_note(inter.guild.id, user.id, note_id)
@@ -1215,12 +1591,12 @@ async def unlock_cmd(ctx): await _unlock(ctx)
 
 @tree.command(name='lock', description='Lock the current channel')
 async def lock_slash(inter: discord.Interaction):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _lock(inter)
 
 @tree.command(name='unlock', description='Unlock the current channel')
 async def unlock_slash(inter: discord.Interaction):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _unlock(inter)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1261,12 +1637,12 @@ async def unlockall_cmd(ctx): await _unlockall(ctx)
 
 @tree.command(name='lockdown', description='Lock all channels')
 async def lockdown_slash(inter: discord.Interaction):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _lockdown(inter)
 
 @tree.command(name='unlockall', description='Unlock all channels')
 async def unlockall_slash(inter: discord.Interaction):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _unlockall(inter)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1291,7 +1667,7 @@ async def nuke_cmd(ctx): await _nuke(ctx)
 
 @tree.command(name='nuke', description='Clone and delete current channel')
 async def nuke_slash(inter: discord.Interaction):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _nuke(inter)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1315,7 +1691,7 @@ async def nickname_cmd(ctx, target: discord.Member = None, *, new_nick=None):
 @tree.command(name='nickname', description="Force change a user's nickname")
 @app_commands.describe(user='User', nickname='New nickname (leave blank to reset)')
 async def nickname_slash(inter: discord.Interaction, user: discord.Member, nickname: str = None):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _nickname(inter, user, nickname)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1343,7 +1719,7 @@ async def role_cmd(ctx, target: discord.Member = None, role: discord.Role = None
 @tree.command(name='role', description='Add or remove a role from a user')
 @app_commands.describe(user='User', role='Role to add/remove')
 async def role_slash(inter: discord.Interaction, user: discord.Member, role: discord.Role):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _role(inter, user, role)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1399,7 +1775,7 @@ async def slowmode_cmd(ctx, seconds: int = None):
 @tree.command(name='slowmode', description='Set channel slowmode')
 @app_commands.describe(seconds='Slowmode in seconds (0 to disable)')
 async def slowmode_slash(inter: discord.Interaction, seconds: int):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _slowmode(inter, seconds)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1425,7 +1801,7 @@ async def filter_cmd(ctx, sub: str = None, *, word: str = None):
 @tree.command(name='filter_add', description='Add a word to the filter')
 @app_commands.describe(word='Word to filter')
 async def filter_add_slash(inter: discord.Interaction, word: str):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     if not is_mod(inter.guild.get_member(inter.user.id)):
         return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
     added = add_filter_word(inter.guild.id, word)
@@ -1434,7 +1810,7 @@ async def filter_add_slash(inter: discord.Interaction, word: str):
 @tree.command(name='filter_remove', description='Remove a word from the filter')
 @app_commands.describe(word='Word to remove')
 async def filter_remove_slash(inter: discord.Interaction, word: str):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     if not is_mod(inter.guild.get_member(inter.user.id)):
         return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
     removed = remove_filter_word(inter.guild.id, word)
@@ -1442,7 +1818,7 @@ async def filter_remove_slash(inter: discord.Interaction, word: str):
 
 @tree.command(name='filter_list', description='List all filtered words')
 async def filter_list_slash(inter: discord.Interaction):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     if not is_mod(inter.guild.get_member(inter.user.id)):
         return await do_reply(inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
     words = get_filter_words(inter.guild.id)
@@ -1467,7 +1843,7 @@ async def avatar_cmd(ctx, target: discord.Member = None):
 @tree.command(name='avatar', description="Show a user's avatar")
 @app_commands.describe(user='User (defaults to yourself)')
 async def avatar_slash(inter: discord.Interaction, user: discord.Member = None):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _avatar(inter, user)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1492,7 +1868,7 @@ async def serverinfo_cmd(ctx): await _serverinfo(ctx)
 
 @tree.command(name='serverinfo', description='Show server information')
 async def serverinfo_slash(inter: discord.Interaction):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _serverinfo(inter)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1513,7 +1889,7 @@ async def logschannel_cmd(ctx, channel: discord.TextChannel = None):
 @tree.command(name='logschannel', description='Set the mod logs channel')
 @app_commands.describe(channel='Channel for mod logs')
 async def logschannel_slash(inter: discord.Interaction, channel: discord.TextChannel):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _logschannel(inter, channel)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1534,7 +1910,7 @@ async def welcomechannel_cmd(ctx, channel: discord.TextChannel = None):
 @tree.command(name='welcomechannel', description='Set the welcome messages channel')
 @app_commands.describe(channel='Channel for welcome messages')
 async def welcomechannel_slash(inter: discord.Interaction, channel: discord.TextChannel):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _welcomechannel(inter, channel)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1559,7 +1935,7 @@ async def transcriptchannel_cmd(ctx, channel: discord.TextChannel = None):
 @tree.command(name='transcriptchannel', description='Set the channel where ticket transcripts are saved')
 @app_commands.describe(channel='Channel for ticket transcripts')
 async def transcriptchannel_slash(inter: discord.Interaction, channel: discord.TextChannel):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _transcriptchannel(inter, channel)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1626,7 +2002,7 @@ async def reviewpanel_cmd(ctx, target: discord.Member = None):
 @tree.command(name='reviewpanel', description='Open chatban review panel')
 @app_commands.describe(user='User to review')
 async def reviewpanel_slash(inter: discord.Interaction, user: discord.Member):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _reviewpanel(inter, user)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1663,7 +2039,7 @@ async def ticketpanel_cmd(ctx, channel: discord.TextChannel = None):
 @tree.command(name='ticketpanel', description='Post the ticket panel in a channel')
 @app_commands.describe(channel='Channel to post the panel in (defaults to current)')
 async def ticketpanel_slash(inter: discord.Interaction, channel: discord.TextChannel = None):
-    await inter.response.defer()
+    await inter.response.defer(ephemeral=True)
     await _ticketpanel(inter, channel)
 
 
@@ -1696,31 +2072,88 @@ async def message_slash(inter: discord.Interaction, text: str, channel: discord.
 #  HELP
 # ═══════════════════════════════════════════════════════════════
 async def _help(ctx_or_inter):
-    e = discord.Embed(title='📚 Moderation Bot Commands', description='Prefix: `.` or `?` — All commands also work as `/command`', color=COLORS['info'])
-    e.add_field(name='⚠️ Warnings',      value='`warn` `warnings` `delwarn`',                                   inline=True)
-    e.add_field(name='🔇 Restrictions',  value='`chatban` `unchatban` `mute` `unmute`',                         inline=True)
-    e.add_field(name='🔨 Moderation',    value='`kick` `ban` `unban`',                                          inline=True)
-    e.add_field(name='🔍 Info',          value='`usercheck` `avatar` `serverinfo`',                             inline=True)
-    e.add_field(name='📝 Notes',         value='`note` `notes` `delnote`',                                      inline=True)
-    e.add_field(name='📢 Channels',      value='`lock` `unlock` `lockdown` `unlockall` `nuke`',                 inline=True)
-    e.add_field(name='🛠️ User Mgmt',    value='`nickname` `role` `slowmode` `purge`',                          inline=True)
-    e.add_field(name='🚫 Filter',        value='`filter add/remove/list`',                                      inline=True)
-    e.add_field(name='🎫 Tickets',       value='`ticketpanel [#channel]`',                                      inline=True)
-    e.add_field(name='⚙️ Config',        value='`logschannel` `welcomechannel` `transcriptchannel` `reviewpanel`', inline=True)
-    e.set_footer(text='Duration format: 10s, 10m, 1h, 2d, 1w  |  Transcripts auto-save to #logs if set')
-    await do_reply(ctx_or_inter, embed=e)
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    guild = ctx_or_inter.guild
+    if not is_mod(guild.get_member(mod.id)):
+        if isinstance(ctx_or_inter, commands.Context):
+            return await ctx_or_inter.reply(embed=error_embed('No Permission', 'Only staff can view the command list.'), ephemeral=True)
+        else:
+            return await ctx_or_inter.response.send_message(embed=error_embed('No Permission', 'Only staff can view the command list.'), ephemeral=True)
+    e = discord.Embed(title='📚 Staff Command Reference', description='Prefix: `.` or `?` — All commands also work as `/command`', color=COLORS['info'])
+    e.add_field(name='⚠️ Warnings',         value='`warn <user> [reason]`\n`warnings <user>`\n`delwarn <user> <id>`',                                inline=False)
+    e.add_field(name='🔇 Restrictions',      value='`chatban <user> [reason]`\n`unchatban <user>`\n`mute <user> <dur> [reason]`\n`unmute <user>`',    inline=False)
+    e.add_field(name='🔨 Moderation',        value='`kick <user> [reason]`\n`ban <user> [reason]`\n`unban <id> [reason]`\n`tempban <user> <dur> [reason]`', inline=False)
+    e.add_field(name='⏳ Warn Expiry',       value='`clearexpired <user> [days]` — remove warnings older than X days (default 30)',                   inline=False)
+    e.add_field(name='🔍 Info',              value='`usercheck <user>`\n`avatar [user]`\n`serverinfo`',                                               inline=False)
+    e.add_field(name='📝 Notes',             value='`note <user> <text>`\n`notes <user>`\n`delnote <user> <id>`',                                     inline=False)
+    e.add_field(name='📢 Channel Mgmt',      value='`lock` `unlock` `lockdown` `unlockall`\n`nuke` `slowmode <secs>` `purge <1-100>`',                inline=False)
+    e.add_field(name='🛠️ User Mgmt',        value='`nickname <user> [name]`\n`role <user> <role>`',                                                  inline=False)
+    e.add_field(name='🚫 Filter',            value='`filter add <word>`\n`filter remove <word>`\n`filter list`',                                      inline=False)
+    e.add_field(name='📊 Stats',             value='`modstats [user]` — mod action breakdown\n`ticketstats` — ticket overview',                       inline=False)
+    e.add_field(name='🎫 Tickets',           value='`ticketpanel [#channel]` — post ticket panel\n`assignticket <staff>` — assign open ticket',       inline=False)
+    e.add_field(name='📌 Sticky Messages',   value='`sticky <text>` — set sticky\n`sticky` (no text) — remove sticky',                               inline=False)
+    e.add_field(name='⏰ Reminders',         value='`remind <duration> <text>` — bot pings you when time is up',                                      inline=False)
+    e.add_field(name='🔍 Review',            value='`reviewpanel <user>` — chatban review panel',                                                     inline=False)
+    e.add_field(name='⚙️ Config',           value='`logschannel <#ch>`\n`welcomechannel <#ch>`\n`transcriptchannel <#ch>`',                          inline=False)
+    e.set_footer(text='Duration format: 10s 10m 1h 2d 1w  |  Logs: edits · deletes · voice · joins · leaves · alts')
+    if isinstance(ctx_or_inter, commands.Context):
+        await ctx_or_inter.reply(embed=e, ephemeral=True)
+    else:
+        if ctx_or_inter.response.is_done():
+            await ctx_or_inter.followup.send(embed=e, ephemeral=True)
+        else:
+            await ctx_or_inter.response.send_message(embed=e, ephemeral=True)
 
 @bot.command(name='help', aliases=['h', 'commands'])
 async def help_cmd(ctx): await _help(ctx)
 
-@tree.command(name='help', description='Show all commands')
+@tree.command(name='help', description='Show all commands (staff only)')
 async def help_slash(inter: discord.Interaction):
-    await inter.response.defer()
     await _help(inter)
 
 # ═══════════════════════════════════════════════════════════════
 #  RUN
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  BACKGROUND TASKS
+# ═══════════════════════════════════════════════════════════════
+from discord.ext import tasks
+
+@tasks.loop(minutes=1)
+async def check_tempbans():
+    now = time.time()
+    for guild in bot.guilds:
+        tempbans = get_tempbans(guild.id)
+        for uid, tban in list(tempbans.items()):
+            try:
+                expires = datetime.datetime.fromisoformat(tban['expires_at'].replace('Z', '+00:00')).timestamp()
+                if now >= expires:
+                    user = await bot.fetch_user(int(uid))
+                    await guild.unban(user, reason='Tempban expired')
+                    remove_tempban(guild.id, uid)
+                    add_mod_action(guild.id, uid, {'type': 'UNBAN', 'moderator_id': str(bot.user.id), 'reason': 'Tempban expired'})
+                    e = discord.Embed(title='⏰ Tempban Expired', color=COLORS['success'], timestamp=discord.utils.utcnow())
+                    e.add_field(name='User', value=f'{user} (`{uid}`)', inline=True)
+                    e.add_field(name='Original Reason', value=tban.get('reason', 'N/A'), inline=True)
+                    await send_log(guild, e)
+            except: pass
+
+@tasks.loop(seconds=30)
+async def check_reminders():
+    now = time.time()
+    reminders = get_all_reminders()
+    for rid, r in list(reminders.items()):
+        try:
+            fire = datetime.datetime.fromisoformat(r['fire_at'].replace('Z', '+00:00')).timestamp()
+            if now >= fire:
+                ch = bot.get_channel(int(r['channel_id']))
+                if ch:
+                    e = discord.Embed(title='⏰ Reminder', description=r['text'], color=COLORS['info'], timestamp=discord.utils.utcnow())
+                    e.set_footer(text=f'Reminder set by <@{r["user_id"]}>')
+                    await ch.send(content=f'<@{r["user_id"]}>', embed=e)
+                remove_reminder(rid)
+        except: pass
+
 if not os.getenv('DISCORD_TOKEN'):
     print('[ERROR] DISCORD_TOKEN not set. Check your .env file.')
     exit(1)
