@@ -1666,6 +1666,32 @@ async def ticketpanel_slash(inter: discord.Interaction, channel: discord.TextCha
     await inter.response.defer()
     await _ticketpanel(inter, channel)
 
+
+# ═══════════════════════════════════════════════════════════════
+#  MESSAGE (owner only)
+# ═══════════════════════════════════════════════════════════════
+BOT_OWNER_ID = 1495861084291334366
+
+@bot.command(name='message', aliases=['say'])
+async def message_cmd(ctx, *, text: str = None):
+    if ctx.author.id != BOT_OWNER_ID:
+        return await ctx.reply(embed=error_embed('No Permission', 'You are not authorised to use this command.'), ephemeral=True)
+    if not text:
+        return await ctx.reply(embed=error_embed('Usage', '.message <text>'))
+    try:
+        await ctx.message.delete()
+    except: pass
+    await ctx.send(text)
+
+@tree.command(name='message', description='Send a message as the bot (owner only)')
+@app_commands.describe(text='Message to send', channel='Channel to send in (defaults to current)')
+async def message_slash(inter: discord.Interaction, text: str, channel: discord.TextChannel = None):
+    if inter.user.id != BOT_OWNER_ID:
+        return await inter.response.send_message(embed=error_embed('No Permission', 'You are not authorised to use this command.'), ephemeral=True)
+    target_ch = channel or inter.channel
+    await inter.response.send_message(embed=success_embed('Sent', f'Message sent to {target_ch.mention}.'), ephemeral=True)
+    await target_ch.send(text)
+
 # ═══════════════════════════════════════════════════════════════
 #  HELP
 # ═══════════════════════════════════════════════════════════════
