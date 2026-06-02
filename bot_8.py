@@ -203,6 +203,24 @@ def remove_reminder(rid):
         del data[rid]
         _save('reminders.json', data)
 
+# --- WARN DM TOGGLE ---
+def get_warn_dm(guild_id):
+    return get_config(guild_id).get('warnDm', True)  # default ON
+
+def set_warn_dm(guild_id, enabled: bool):
+    set_config(guild_id, 'warnDm', enabled)
+
+# --- TICKET COOLDOWN ---
+def get_ticket_cooldown(guild_id, user_id):
+    data = _load('ticket_cooldowns.json')
+    return data.get(str(guild_id), {}).get(str(user_id), 0)
+
+def set_ticket_cooldown(guild_id, user_id):
+    data = _load('ticket_cooldowns.json')
+    data.setdefault(str(guild_id), {})[str(user_id)] = time.time()
+    _save('ticket_cooldowns.json', data)
+
+
 
 # ═══════════════════════════════════════════════════════════════
 #  HELPERS
@@ -628,6 +646,59 @@ async def remind_slash(inter: discord.Interaction, duration: str, text: str):
 # ═══════════════════════════════════════════════════════════════
 #  TICKET VIEWS
 # ═══════════════════════════════════════════════════════════════
+
+class TicketCloseModal(discord.ui.Modal, title='Close Ticket'):
+    reason = discord.ui.TextInput(
+        label='Reason for closing',
+        style=discord.TextStyle.paragraph,
+        placeholder='Enter the reason this ticket is being closed...',
+        required=False,
+        max_length=500
+    )
+
+    def __init__(self, channel, ticket_data):
+        super().__init__()
+        self.channel = channel
+        self.ticket_data = ticket_data
+
+    async def on_submit(self, inter: discord.Interaction):
+        close_reason = self.reason.value or 'No reason provided'
+        td = self.ticket_data
+        td['open'] = False
+        td['closed_at'] = _now()
+        td['closed_by'] = str(inter.user.id)
+        td['close_reason'] = close_reason
+        save_ticket(inter.guild.id, self.channel.id, td)
+
+        await send_transcript(inter.guild, self.channel, td)
+
+        embed = discord.Embed(
+            title='🔒 Ticket Closing',
+            description=f'This ticket will be deleted in **5 seconds**.\n📋 Transcript has been saved.',
+            color=COLORS['error'],
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name='Closed by', value=inter.user.mention, inline=True)
+        embed.add_field(name='Reason', value=close_reason, inline=False)
+        await self.channel.send(embed=embed)
+        await inter.response.send_message(embed=success_embed('Ticket Closing', 'Ticket will be deleted in 5 seconds.'), ephemeral=True)
+
+        cat_info = TICKET_CATEGORIES.get(td.get('type', 'general'), TICKET_CATEGORIES['general'])
+        log_embed = discord.Embed(title='🎫 Ticket Closed', color=COLORS['mod'], timestamp=discord.utils.utcnow())
+        log_embed.add_field(name='Channel',    value=self.channel.name,           inline=True)
+        log_embed.add_field(name='Opened by',  value=f'<@{td["user_id"]}>',       inline=True)
+        log_embed.add_field(name='Closed by',  value=inter.user.mention,          inline=True)
+        log_embed.add_field(name='Type',       value=cat_info['label'],           inline=True)
+        log_embed.add_field(name='Reason',     value=close_reason,                inline=False)
+        await send_log(inter.guild, log_embed)
+
+        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
+        try:
+            await self.channel.delete(reason=f'Ticket closed by {inter.user}: {close_reason}')
+            delete_ticket_record(inter.guild.id, self.channel.id)
+        except: pass
+
+
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -640,38 +711,9 @@ class TicketControlView(discord.ui.View):
         is_owner = str(inter.user.id) == str(ticket_data.get('user_id'))
         if not is_owner and not is_mod(inter.guild.get_member(inter.user.id)):
             return await inter.response.send_message(embed=error_embed('No Permission', 'Only the ticket owner or staff can close this.'), ephemeral=True)
-        await inter.response.defer()
+        await inter.response.send_modal(TicketCloseModal(inter.channel, ticket_data))
 
-        ticket_data['open'] = False
-        ticket_data['closed_at'] = _now()
-        ticket_data['closed_by'] = str(inter.user.id)
-        save_ticket(inter.guild.id, inter.channel.id, ticket_data)
-
-        # Save transcript BEFORE deleting the channel
-        await send_transcript(inter.guild, inter.channel, ticket_data)
-
-        embed = discord.Embed(
-            title='🔒 Ticket Closing',
-            description='This ticket will be deleted in **5 seconds**.\n📋 Transcript has been saved.',
-            color=COLORS['error'],
-            timestamp=discord.utils.utcnow()
-        )
-        embed.add_field(name='Closed by', value=inter.user.mention)
-        await inter.channel.send(embed=embed)
-
-        cat_info = TICKET_CATEGORIES.get(ticket_data.get('type', 'general'), TICKET_CATEGORIES['general'])
-        log_embed = discord.Embed(title='🎫 Ticket Closed', color=COLORS['mod'], timestamp=discord.utils.utcnow())
-        log_embed.add_field(name='Channel', value=inter.channel.name, inline=True)
-        log_embed.add_field(name='Opened by', value=f'<@{ticket_data["user_id"]}>', inline=True)
-        log_embed.add_field(name='Closed by', value=inter.user.mention, inline=True)
-        log_embed.add_field(name='Type', value=cat_info['label'], inline=True)
-        await send_log(inter.guild, log_embed)
-
-        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
-        try:
-            await inter.channel.delete(reason=f'Ticket closed by {inter.user}')
-            delete_ticket_record(inter.guild.id, inter.channel.id)
-        except: pass
+        # Handled by TicketCloseModal
 
     @discord.ui.button(label='👋 Claim', style=discord.ButtonStyle.primary, custom_id='ticket_claim')
     async def claim_ticket(self, inter: discord.Interaction, button: discord.ui.Button):
@@ -893,6 +935,17 @@ class TicketTypeSelect(discord.ui.Select):
         ticket_type = self.values[0]
         guild = inter.guild
         user = inter.user
+
+        # Ticket cooldown check (10 minutes between tickets)
+        COOLDOWN_SECS = 600
+        last = get_ticket_cooldown(guild.id, user.id)
+        if time.time() - last < COOLDOWN_SECS and not is_mod(guild.get_member(user.id)):
+            remaining = int(COOLDOWN_SECS - (time.time() - last))
+            mins, secs = divmod(remaining, 60)
+            return await inter.response.send_message(
+                embed=error_embed('Cooldown', f'You must wait **{mins}m {secs}s** before opening another ticket.'),
+                ephemeral=True
+            )
 
         # Check for existing open ticket
         existing_tickets = get_tickets(guild.id)
@@ -1201,8 +1254,9 @@ async def _warn(ctx_or_inter, target: discord.Member, reason='No reason provided
     if note: e.description = note
     await send_log(guild, e)
     await do_reply(ctx_or_inter, embed=e)
-    try: await target.send(embed=warn_embed('You were warned', f'**Server:** {guild.name}\n**Reason:** {reason}\n**Warnings:** {count}'))
-    except: pass
+    if get_warn_dm(guild.id):
+        try: await target.send(embed=warn_embed('You were warned', f'**Server:** {guild.name}\n**Reason:** {reason}\n**Warnings:** {count}'))
+        except: pass
 
 @bot.command(name='warn')
 async def warn_cmd(ctx, target: discord.Member = None, *, reason='No reason provided'):
@@ -2070,6 +2124,129 @@ async def message_slash(inter: discord.Interaction, text: str, channel: discord.
     await target_ch.send(text)
 
 # ═══════════════════════════════════════════════════════════════
+#  WARN DM TOGGLE
+# ═══════════════════════════════════════════════════════════════
+async def _warndm(ctx_or_inter, enabled: bool):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
+    set_warn_dm(ctx_or_inter.guild.id, enabled)
+    status = 'enabled ✅' if enabled else 'disabled ❌'
+    await do_reply(ctx_or_inter, embed=success_embed('Warn DM Updated', f'Warning DMs are now **{status}**. Users will {"" if enabled else "not "}receive a DM when warned.'))
+
+@bot.command(name='warndm')
+async def warndm_cmd(ctx, toggle: str = None):
+    if toggle not in ('on', 'off'): return await ctx.reply(embed=error_embed('Usage', '.warndm on/off'))
+    await _warndm(ctx, toggle == 'on')
+
+@tree.command(name='warndm', description='Toggle whether users are DMed when warned')
+@app_commands.describe(enabled='Turn warn DMs on or off')
+@app_commands.choices(enabled=[app_commands.Choice(name='On', value=1), app_commands.Choice(name='Off', value=0)])
+async def warndm_slash(inter: discord.Interaction, enabled: int):
+    await _warndm(inter, bool(enabled))
+
+# ═══════════════════════════════════════════════════════════════
+#  GIVEAWAY
+# ═══════════════════════════════════════════════════════════════
+async def _giveaway(ctx_or_inter, duration_str: str, prize: str, channel: discord.TextChannel = None):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_mod(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need moderation permissions.'))
+    secs = parse_duration(duration_str)
+    if not secs: return await do_reply(ctx_or_inter, embed=error_embed('Invalid Duration', 'Use: 10m, 1h, 2d, 1w'))
+    target_ch = channel or ctx_or_inter.channel
+    ends_at = discord.utils.utcnow() + datetime.timedelta(seconds=secs)
+    e = discord.Embed(
+        title='🎉 GIVEAWAY 🎉',
+        description=f'**Prize:** {prize}\n\nReact with 🎉 to enter!\n\n**Ends:** {discord.utils.format_dt(ends_at, "R")}',
+        color=0x5865F2,
+        timestamp=ends_at
+    )
+    e.set_footer(text=f'Ends at • Hosted by {mod}')
+    msg = await target_ch.send(embed=e)
+    await msg.add_reaction('🎉')
+    await do_reply(ctx_or_inter, embed=success_embed('Giveaway Started', f'Giveaway posted in {target_ch.mention}! Ends in **{duration_str}**.'))
+    await asyncio.sleep(secs)
+    try:
+        msg = await target_ch.fetch_message(msg.id)
+        reaction = discord.utils.get(msg.reactions, emoji='🎉')
+        users = [u async for u in reaction.users() if not u.bot]
+        if not users:
+            await target_ch.send(embed=warn_embed('Giveaway Ended', f'No valid entries for **{prize}**. Nobody won!'))
+            return
+        import random
+        winner = random.choice(users)
+        win_embed = discord.Embed(
+            title='🎊 Giveaway Ended!',
+            description=f'**Prize:** {prize}\n\n🏆 **Winner:** {winner.mention}\n\nCongratulations!',
+            color=0x57F287,
+            timestamp=discord.utils.utcnow()
+        )
+        win_embed.set_footer(text=f'Hosted by {mod}')
+        await target_ch.send(content=winner.mention, embed=win_embed)
+    except: pass
+
+@bot.command(name='giveaway', aliases=['gw'])
+async def giveaway_cmd(ctx, duration: str = None, channel: discord.TextChannel = None, *, prize: str = None):
+    if not duration or not prize: return await ctx.reply(embed=error_embed('Usage', '.giveaway <duration> [#channel] <prize>'))
+    await _giveaway(ctx, duration, prize, channel)
+
+@tree.command(name='giveaway', description='Start a giveaway')
+@app_commands.describe(duration='Duration (10m, 1h, 2d)', prize='What are you giving away?', channel='Channel to post in (defaults to current)')
+async def giveaway_slash(inter: discord.Interaction, duration: str, prize: str, channel: discord.TextChannel = None):
+    await inter.response.defer(ephemeral=True)
+    await _giveaway(inter, duration, prize, channel)
+
+# ═══════════════════════════════════════════════════════════════
+#  EMBED BUILDER
+# ═══════════════════════════════════════════════════════════════
+class EmbedBuilderModal(discord.ui.Modal, title='Embed Builder'):
+    embed_title = discord.ui.TextInput(label='Title', max_length=256, required=True)
+    embed_description = discord.ui.TextInput(label='Description', style=discord.TextStyle.paragraph, max_length=2048, required=True)
+    embed_colour = discord.ui.TextInput(label='Colour (hex, e.g. #5865F2)', max_length=7, required=False, placeholder='#5865F2')
+    embed_image = discord.ui.TextInput(label='Image URL (optional)', required=False, placeholder='https://...')
+    embed_footer = discord.ui.TextInput(label='Footer text (optional)', max_length=256, required=False)
+
+    def __init__(self, target_channel):
+        super().__init__()
+        self.target_channel = target_channel
+
+    async def on_submit(self, inter: discord.Interaction):
+        try:
+            colour_str = self.embed_colour.value.strip().lstrip('#')
+            colour = int(colour_str, 16) if colour_str else 0x5865F2
+        except ValueError:
+            colour = 0x5865F2
+        e = discord.Embed(
+            title=self.embed_title.value,
+            description=self.embed_description.value,
+            color=colour,
+            timestamp=discord.utils.utcnow()
+        )
+        if self.embed_image.value.strip():
+            e.set_image(url=self.embed_image.value.strip())
+        if self.embed_footer.value.strip():
+            e.set_footer(text=self.embed_footer.value.strip())
+        await self.target_channel.send(embed=e)
+        await inter.response.send_message(embed=success_embed('Embed Sent', f'Your embed has been posted in {self.target_channel.mention}.'), ephemeral=True)
+
+@bot.command(name='embed')
+async def embed_cmd(ctx, channel: discord.TextChannel = None):
+    if not is_mod(ctx.author): return await ctx.reply(embed=error_embed('No Permission', 'You need moderation permissions.'))
+    target = channel or ctx.channel
+    # Prefix commands can't open modals so we send a slash-only notice
+    await ctx.reply(embed=info_embed('Use Slash Command', 'Please use `/embed` to open the embed builder — modals only work with slash commands.'))
+
+@tree.command(name='embed', description='Build and send a custom embed to a channel')
+@app_commands.describe(channel='Channel to send the embed to (defaults to current)')
+async def embed_slash(inter: discord.Interaction, channel: discord.TextChannel = None):
+    if not is_mod(inter.guild.get_member(inter.user.id)):
+        return await inter.response.send_message(embed=error_embed('No Permission', 'You need moderation permissions.'), ephemeral=True)
+    target = channel or inter.channel
+    await inter.response.send_modal(EmbedBuilderModal(target))
+
+
+# ═══════════════════════════════════════════════════════════════
 #  HELP
 # ═══════════════════════════════════════════════════════════════
 async def _help(ctx_or_inter):
@@ -2095,7 +2272,9 @@ async def _help(ctx_or_inter):
     e.add_field(name='📌 Sticky Messages',   value='`sticky <text>` — set sticky\n`sticky` (no text) — remove sticky',                               inline=False)
     e.add_field(name='⏰ Reminders',         value='`remind <duration> <text>` — bot pings you when time is up',                                      inline=False)
     e.add_field(name='🔍 Review',            value='`reviewpanel <user>` — chatban review panel',                                                     inline=False)
-    e.add_field(name='⚙️ Config',           value='`logschannel <#ch>`\n`welcomechannel <#ch>`\n`transcriptchannel <#ch>`',                          inline=False)
+    e.add_field(name='🎉 Giveaway',          value='`giveaway <dur> [#ch] <prize>` — starts a giveaway, picks winner automatically',         inline=False)
+    e.add_field(name='🎨 Embed Builder',     value='`/embed [#channel]` — build and send a custom embed (slash only)',                        inline=False)
+    e.add_field(name='⚙️ Config',           value='`logschannel <#ch>`\n`welcomechannel <#ch>`\n`transcriptchannel <#ch>`\n`warndm on/off` — toggle warn DMs',  inline=False)
     e.set_footer(text='Duration format: 10s 10m 1h 2d 1w  |  Logs: edits · deletes · voice · joins · leaves · alts')
     if isinstance(ctx_or_inter, commands.Context):
         await ctx_or_inter.reply(embed=e, ephemeral=True)
