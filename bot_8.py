@@ -413,10 +413,15 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 intents.moderation = True
+intents.invites     = True
 
 bot = commands.Bot(command_prefix=PREFIXES, intents=intents, help_command=None)
 tree = bot.tree
 spam_map = {}
+snipe_map = {}   # channel_id -> {author, content, attachments, timestamp}
+invite_cache = {}  # guild_id -> {code: uses}
+giveaway_store = {}  # msg_id -> {prize, host_id, channel_id, role_id}
+
 
 # ═══════════════════════════════════════════════════════════════
 #  TEMPBAN
@@ -738,6 +743,31 @@ class TicketControlView(discord.ui.View):
             return await inter.response.send_message(embed=error_embed('No Permission', 'Only staff can add users.'), ephemeral=True)
         await inter.response.send_modal(AddUserModal(inter.channel))
 
+    @discord.ui.button(label='📂 Archive', style=discord.ButtonStyle.secondary, custom_id='ticket_archive')
+    async def archive_ticket(self, inter: discord.Interaction, button: discord.ui.Button):
+        if not is_mod(inter.guild.get_member(inter.user.id)):
+            return await inter.response.send_message(embed=error_embed('No Permission', 'Only staff can archive tickets.'), ephemeral=True)
+        ticket_data = get_tickets(inter.guild.id).get(str(inter.channel.id))
+        if not ticket_data:
+            return await inter.response.send_message(embed=error_embed('Error', 'Not a tracked ticket.'), ephemeral=True)
+        await inter.response.defer()
+        archive_cat = discord.utils.get(inter.guild.categories, name='Archived Tickets')
+        if not archive_cat:
+            archive_cat = await inter.guild.create_category('Archived Tickets')
+        await inter.channel.edit(category=archive_cat, name=inter.channel.name.replace('ticket-', 'archived-'))
+        # Remove user view permission
+        opener = inter.guild.get_member(int(ticket_data.get('user_id', 0)))
+        if opener:
+            try: await inter.channel.set_permissions(opener, view_channel=False)
+            except: pass
+        ticket_data['archived'] = True
+        ticket_data['archived_by'] = str(inter.user.id)
+        ticket_data['archived_at'] = _now()
+        save_ticket(inter.guild.id, inter.channel.id, ticket_data)
+        e = discord.Embed(title='📂 Ticket Archived', description=f'Archived by {inter.user.mention}. Staff can reopen with the button below.', color=0xFEE75C, timestamp=discord.utils.utcnow())
+        await inter.channel.send(embed=e, view=ReopenTicketView())
+        await send_log(inter.guild, discord.Embed(title='📂 Ticket Archived', color=0xFEE75C, timestamp=discord.utils.utcnow()).add_field(name='Channel', value=inter.channel.name).add_field(name='By', value=inter.user.mention))
+
 
 class AddUserModal(discord.ui.Modal, title='Add User to Ticket'):
     user_id = discord.ui.TextInput(label='User ID or mention', placeholder='123456789012345678')
@@ -922,6 +952,36 @@ class RulesCheckView(discord.ui.View):
         )
 
 
+
+class ReopenTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='🔓 Reopen Ticket', style=discord.ButtonStyle.success, custom_id='ticket_reopen')
+    async def reopen(self, inter: discord.Interaction, button: discord.ui.Button):
+        if not is_mod(inter.guild.get_member(inter.user.id)):
+            return await inter.response.send_message(embed=error_embed('No Permission', 'Only staff can reopen tickets.'), ephemeral=True)
+        ticket_data = get_tickets(inter.guild.id).get(str(inter.channel.id))
+        if not ticket_data:
+            return await inter.response.send_message(embed=error_embed('Error', 'Not a tracked ticket.'), ephemeral=True)
+        await inter.response.defer()
+        ticket_cat = discord.utils.get(inter.guild.categories, name='Tickets')
+        if not ticket_cat:
+            ticket_cat = await inter.guild.create_category('Tickets')
+        await inter.channel.edit(category=ticket_cat, name=inter.channel.name.replace('archived-', 'ticket-'))
+        opener = inter.guild.get_member(int(ticket_data.get('user_id', 0)))
+        if opener:
+            try: await inter.channel.set_permissions(opener, view_channel=True, send_messages=True, read_message_history=True)
+            except: pass
+        ticket_data['archived'] = False
+        ticket_data['open'] = True
+        ticket_data.pop('archived_by', None)
+        ticket_data.pop('archived_at', None)
+        save_ticket(inter.guild.id, inter.channel.id, ticket_data)
+        e = discord.Embed(title='🔓 Ticket Reopened', description=f'Reopened by {inter.user.mention}.', color=0x57F287, timestamp=discord.utils.utcnow())
+        await inter.channel.send(embed=e, view=TicketControlView())
+        await send_log(inter.guild, discord.Embed(title='🔓 Ticket Reopened', color=0x57F287, timestamp=discord.utils.utcnow()).add_field(name='Channel', value=inter.channel.name).add_field(name='By', value=inter.user.mention))
+
 class TicketTypeSelect(discord.ui.Select):
     def __init__(self):
         options = [
@@ -1014,6 +1074,7 @@ async def on_ready():
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='over Sparky AI'))
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView())
+    bot.add_view(ReopenTicketView())
 
     # Auto-detect a channel named 'logs' and set as transcript channel if not already set
     for guild in bot.guilds:
@@ -1033,9 +1094,18 @@ async def on_ready():
     else:
         await tree.sync()
         print('[DEPLOY] Global slash commands synced')
+    # Cache invites for invite tracking
+    for guild in bot.guilds:
+        try:
+            invites = await guild.fetch_invites()
+            invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
+        except: pass
+
     # Start background tasks
     check_tempbans.start()
     check_reminders.start()
+    check_giveaways.start()
+    update_stats_channels.start()
     print('[READY] Bot is fully operational.')
 
 # ═══════════════════════════════════════════════════════════════
@@ -1131,6 +1201,29 @@ async def on_member_join(member):
         await welcome_ch.send(content=f'🎊 Welcome to the server, {member.mention}! We\'ve been expecting you.', embed=e)
     except: pass
 
+    # Invite tracking
+    if log_id:
+        log_ch = member.guild.get_channel(int(log_id))
+        if log_ch:
+            try:
+                new_invites = await member.guild.fetch_invites()
+                new_inv_map = {inv.code: inv.uses for inv in new_invites}
+                old_inv_map = invite_cache.get(member.guild.id, {})
+                used_invite = None
+                for code, uses in new_inv_map.items():
+                    if old_inv_map.get(code, 0) < uses:
+                        used_invite = next((i for i in new_invites if i.code == code), None)
+                        break
+                invite_cache[member.guild.id] = new_inv_map
+                if used_invite:
+                    ie = discord.Embed(title='🔗 Invite Used', color=0x5865F2, timestamp=discord.utils.utcnow())
+                    ie.add_field(name='Member', value=f'{member.mention} (`{member.id}`)', inline=True)
+                    ie.add_field(name='Invite Code', value=f'`{used_invite.code}`', inline=True)
+                    ie.add_field(name='Created by', value=f'{used_invite.inviter.mention if used_invite.inviter else "Unknown"}', inline=True)
+                    ie.add_field(name='Uses', value=str(used_invite.uses), inline=True)
+                    await log_ch.send(embed=ie)
+            except: pass
+
     # Alt detection — alert mods if another account was created within 24h of this one
     alts = [m for m in member.guild.members if m.id != member.id and
             abs((m.created_at - member.created_at).total_seconds()) < 86400]
@@ -1188,6 +1281,13 @@ async def on_message_edit(before, after):
 @bot.event
 async def on_message_delete(message):
     if message.author.bot or not message.guild: return
+    # Store for snipe
+    snipe_map[message.channel.id] = {
+        'author': str(message.author),
+        'author_icon': message.author.display_avatar.url,
+        'content': message.content or '*attachment/embed only*',
+        'timestamp': discord.utils.utcnow()
+    }
     cfg = get_config(message.guild.id)
     ch_id = cfg.get('logsChannelId')
     if not ch_id: return
@@ -1222,6 +1322,47 @@ async def on_voice_state_update(member, before, after):
     e.set_thumbnail(url=member.display_avatar.url)
     try: await ch.send(embed=e)
     except: pass
+
+@bot.event
+async def on_invite_create(invite):
+    if invite.guild.id not in invite_cache:
+        invite_cache[invite.guild.id] = {}
+    invite_cache[invite.guild.id][invite.code] = invite.uses
+
+@bot.event
+async def on_invite_delete(invite):
+    if invite.guild.id in invite_cache:
+        invite_cache[invite.guild.id].pop(invite.code, None)
+
+@bot.event
+async def on_member_update(before, after):
+    cfg = get_config(before.guild.id)
+    ch_id = cfg.get('logsChannelId')
+    if not ch_id: return
+    ch = before.guild.get_channel(int(ch_id))
+    if not ch: return
+
+    # Nickname change
+    if before.nick != after.nick:
+        e = discord.Embed(title='✏️ Nickname Changed', color=0xFEE75C, timestamp=discord.utils.utcnow())
+        e.set_author(name=str(after), icon_url=after.display_avatar.url)
+        e.add_field(name='Before', value=before.nick or '*None*', inline=True)
+        e.add_field(name='After',  value=after.nick  or '*None*', inline=True)
+        e.add_field(name='User',   value=f'{after.mention} (`{after.id}`)', inline=False)
+        try: await ch.send(embed=e)
+        except: pass
+
+    # Role change
+    added   = [r for r in after.roles  if r not in before.roles]
+    removed = [r for r in before.roles if r not in after.roles]
+    if added or removed:
+        e = discord.Embed(title='🎭 Roles Updated', color=0x5865F2, timestamp=discord.utils.utcnow())
+        e.set_author(name=str(after), icon_url=after.display_avatar.url)
+        e.add_field(name='User', value=f'{after.mention} (`{after.id}`)', inline=False)
+        if added:   e.add_field(name='➕ Added',   value=' '.join(r.mention for r in added),   inline=True)
+        if removed: e.add_field(name='➖ Removed', value=' '.join(r.mention for r in removed), inline=True)
+        try: await ch.send(embed=e)
+        except: pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2247,6 +2388,61 @@ async def embed_slash(inter: discord.Interaction, channel: discord.TextChannel =
 
 
 # ═══════════════════════════════════════════════════════════════
+#  SNIPE
+# ═══════════════════════════════════════════════════════════════
+@bot.command(name='snipe', aliases=['s'])
+async def snipe_cmd(ctx):
+    if not is_mod(ctx.author): return await ctx.reply(embed=error_embed('No Permission', 'You need moderation permissions.'))
+    data = snipe_map.get(ctx.channel.id)
+    if not data: return await ctx.reply(embed=info_embed('Nothing to Snipe', 'No recently deleted messages in this channel.'))
+    e = discord.Embed(description=data['content'], color=0xED4245, timestamp=data['timestamp'])
+    e.set_author(name=data['author'], icon_url=data['author_icon'])
+    e.set_footer(text='Message was deleted')
+    await ctx.reply(embed=e)
+
+@tree.command(name='snipe', description='Show the last deleted message in this channel')
+async def snipe_slash(inter: discord.Interaction):
+    if not is_mod(inter.guild.get_member(inter.user.id)):
+        return await inter.response.send_message(embed=error_embed('No Permission', 'You need moderation permissions.'), ephemeral=True)
+    data = snipe_map.get(inter.channel.id)
+    if not data: return await inter.response.send_message(embed=info_embed('Nothing to Snipe', 'No recently deleted messages in this channel.'), ephemeral=True)
+    e = discord.Embed(description=data['content'], color=0xED4245, timestamp=data['timestamp'])
+    e.set_author(name=data['author'], icon_url=data['author_icon'])
+    e.set_footer(text='Message was deleted')
+    await inter.response.send_message(embed=e, ephemeral=True)
+
+# ═══════════════════════════════════════════════════════════════
+#  SERVER STATS CHANNELS
+# ═══════════════════════════════════════════════════════════════
+async def _setstats(ctx_or_inter, kind: str, channel: discord.VoiceChannel):
+    mod = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
+    if not is_admin(ctx_or_inter.guild.get_member(mod.id)):
+        return await do_reply(ctx_or_inter, embed=error_embed('No Permission', 'You need Manage Guild permission.'))
+    valid = ('members', 'bots', 'channels', 'roles')
+    if kind not in valid:
+        return await do_reply(ctx_or_inter, embed=error_embed('Invalid Type', f'Valid types: {", ".join(valid)}'))
+    set_stats_channel(ctx_or_inter.guild.id, kind, channel.id)
+    await do_reply(ctx_or_inter, embed=success_embed('Stats Channel Set', f'**{kind.capitalize()}** count will display in {channel.mention}. Updates every 10 minutes.'))
+
+@bot.command(name='setstats')
+async def setstats_cmd(ctx, kind: str = None, channel: discord.VoiceChannel = None):
+    if not kind or not channel: return await ctx.reply(embed=error_embed('Usage', '.setstats <members/bots/channels/roles> <voice channel>'))
+    await _setstats(ctx, kind, channel)
+
+@tree.command(name='setstats', description='Set a voice channel as a live server stats display')
+@app_commands.describe(kind='What to count', channel='Voice channel to use as stats display')
+@app_commands.choices(kind=[
+    app_commands.Choice(name='Members', value='members'),
+    app_commands.Choice(name='Bots', value='bots'),
+    app_commands.Choice(name='Channels', value='channels'),
+    app_commands.Choice(name='Roles', value='roles'),
+])
+async def setstats_slash(inter: discord.Interaction, kind: str, channel: discord.VoiceChannel):
+    await inter.response.defer(ephemeral=True)
+    await _setstats(inter, kind, channel)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  HELP
 # ═══════════════════════════════════════════════════════════════
 async def _help(ctx_or_inter):
@@ -2272,9 +2468,12 @@ async def _help(ctx_or_inter):
     e.add_field(name='📌 Sticky Messages',   value='`sticky <text>` — set sticky\n`sticky` (no text) — remove sticky',                               inline=False)
     e.add_field(name='⏰ Reminders',         value='`remind <duration> <text>` — bot pings you when time is up',                                      inline=False)
     e.add_field(name='🔍 Review',            value='`reviewpanel <user>` — chatban review panel',                                                     inline=False)
-    e.add_field(name='🎉 Giveaway',          value='`giveaway <dur> [#ch] <prize>` — starts a giveaway, picks winner automatically',         inline=False)
-    e.add_field(name='🎨 Embed Builder',     value='`/embed [#channel]` — build and send a custom embed (slash only)',                        inline=False)
-    e.add_field(name='⚙️ Config',           value='`logschannel <#ch>`\n`welcomechannel <#ch>`\n`transcriptchannel <#ch>`\n`warndm on/off` — toggle warn DMs',  inline=False)
+    e.add_field(name='🎉 Giveaway',         value='`giveaway <dur> [#ch] <prize>`\n`reroll <msg_id>` — reroll winner\n`/giveaway` supports required role',   inline=False)
+    e.add_field(name='🎨 Embed Builder',    value='`/embed [#channel]` — build and send a custom embed (slash only)',                                        inline=False)
+    e.add_field(name='🔍 Snipe',            value='`snipe` — show last deleted message in this channel',                                                   inline=False)
+    e.add_field(name='📊 Server Stats',     value='`setstats <members/bots/channels/roles> <voice ch>` — live updating stat channels',                   inline=False)
+    e.add_field(name='📂 Ticket Archive',   value='Archive button on tickets — moves to Archived category, Reopen button to restore',                    inline=False)
+    e.add_field(name='⚙️ Config',          value='`logschannel <#ch>`\n`welcomechannel <#ch>`\n`transcriptchannel <#ch>`\n`warndm on/off`',              inline=False)
     e.set_footer(text='Duration format: 10s 10m 1h 2d 1w  |  Logs: edits · deletes · voice · joins · leaves · alts')
     if isinstance(ctx_or_inter, commands.Context):
         await ctx_or_inter.reply(embed=e, ephemeral=True)
@@ -2317,6 +2516,48 @@ async def check_tempbans():
                     e.add_field(name='Original Reason', value=tban.get('reason', 'N/A'), inline=True)
                     await send_log(guild, e)
             except: pass
+
+@tasks.loop(minutes=1)
+async def check_giveaways():
+    import random
+    now = time.time()
+    all_gws = get_all_giveaways()
+    for guild_id, gws in all_gws.items():
+        guild = bot.get_guild(int(guild_id))
+        if not guild: continue
+        for msg_id, gw in list(gws.items()):
+            if gw.get('ended'): continue
+            try:
+                ends = datetime.datetime.fromisoformat(gw['ends_at'].replace('Z', '+00:00')).timestamp()
+                if now < ends: continue
+                winner = await _pick_giveaway_winner(guild, gw['channel_id'], int(msg_id), gw['prize'], gw['host_id'], gw.get('required_role_id'))
+                ch = guild.get_channel(int(gw['channel_id']))
+                if ch:
+                    if winner:
+                        win_embed = discord.Embed(title='🎊 Giveaway Ended!', description=f'**Prize:** {gw["prize"]}\n\n🏆 **Winner:** {winner.mention}\n\nCongratulations!', color=0x57F287, timestamp=discord.utils.utcnow())
+                        win_embed.set_footer(text=f'Hosted by user {gw["host_id"]}')
+                        await ch.send(content=winner.mention, embed=win_embed)
+                    else:
+                        await ch.send(embed=warn_embed('Giveaway Ended', f'No valid entries for **{gw["prize"]}**. Nobody won!'))
+                gw['ended'] = True
+                save_giveaway(guild_id, msg_id, gw)
+            except: pass
+
+@tasks.loop(minutes=10)
+async def update_stats_channels():
+    for guild in bot.guilds:
+        stats = get_stats_channels(guild.id)
+        labels = {
+            'members':  (f'👥 Members: {sum(1 for m in guild.members if not m.bot)}'),
+            'bots':     (f'🤖 Bots: {sum(1 for m in guild.members if m.bot)}'),
+            'channels': (f'📢 Channels: {len(guild.channels)}'),
+            'roles':    (f'🎭 Roles: {len(guild.roles)}'),
+        }
+        for kind, ch_id in stats.items():
+            ch = guild.get_channel(int(ch_id))
+            if ch and kind in labels:
+                try: await ch.edit(name=labels[kind])
+                except: pass
 
 @tasks.loop(seconds=30)
 async def check_reminders():
