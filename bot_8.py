@@ -1111,37 +1111,114 @@ async def on_ready():
 # ═══════════════════════════════════════════════════════════════
 #  EVENTS
 # ═══════════════════════════════════════════════════════════════
+async def _auto_mute(member, guild, channel, reason, duration_mins=5):
+    """Shared helper to timeout and notify for auto-mod actions."""
+    try:
+        until = discord.utils.utcnow() + datetime.timedelta(minutes=duration_mins)
+        await member.timeout(until, reason=f'Auto-mod: {reason}')
+        await send_log(guild, mod_embed(f'Auto Mute ({reason})', bot.user, member, reason, {'Duration': f'{duration_mins} min'}))
+        m = await channel.send(embed=warn_embed('Auto-Mod Action', f'{member.mention} has been muted for **{duration_mins} minutes** — {reason}.'))
+        await asyncio.sleep(6)
+        try: await m.delete()
+        except: pass
+        return True
+    except: return False
+
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild: return
-    words = get_filter_words(message.guild.id)
-    if words and any(w in message.content.lower() for w in words):
-        await message.delete()
-        m = await message.channel.send(embed=warn_embed('Message Filtered', f'{message.author.mention}, your message contained a banned word.'))
-        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
-        await m.delete()
+
+    member = message.guild.get_member(message.author.id)
+    # Skip all auto-mod for users with manage_messages or higher
+    if member and member.guild_permissions.manage_messages:
+        await bot.process_commands(message)
         return
+
     now = time.time()
     uid = message.author.id
-    spam_map.setdefault(uid, [])
-    spam_map[uid] = [t for t in spam_map[uid] if now - t < 10]
-    spam_map[uid].append(now)
-    if len(spam_map[uid]) >= 6:
-        spam_map[uid] = []
-        member = message.guild.get_member(uid)
-        if member and not member.guild_permissions.manage_messages:
-            try:
-                until = discord.utils.utcnow() + datetime.timedelta(minutes=5)
-                await member.timeout(until, reason='Auto: spam detection')
-                await send_log(message.guild, mod_embed('Auto Mute (Spam)', bot.user, message.author, 'Spam detection', {'Duration': '5 min'}))
-                m = await message.channel.send(embed=warn_embed('Spam Detected', f'{message.author.mention} muted 5 minutes for spamming.'))
-                await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=6))
-                await m.delete()
-            except: pass
+    gid = message.guild.id
+    key = (gid, uid)
+    acted = False
+
+    # ── Word filter ─────────────────────────────────────────────
+    words = get_filter_words(gid)
+    if words and any(w in message.content.lower() for w in words):
+        try: await message.delete()
+        except: pass
+        m = await message.channel.send(embed=warn_embed('Message Filtered', f'{message.author.mention}, your message contained a banned word.'))
+        await asyncio.sleep(5)
+        try: await m.delete()
+        except: pass
         return
-    # Sticky message handler
-    sticky = get_sticky(message.guild.id, message.channel.id)
-    if sticky and not message.author.bot:
+
+    # ── Anti-invite ──────────────────────────────────────────────
+    INVITE_RE = re.compile(r'(discord[.]gg/|discord[.]com/invite/|discordapp[.]com/invite/)\S+', re.IGNORECASE)
+    if INVITE_RE.search(message.content):
+        try: await message.delete()
+        except: pass
+        await apply_chatban(message.guild, uid, 'Auto: posting a Discord invite link', bot.user.id)
+        add_mod_action(gid, uid, {'type': 'CHATBAN', 'moderator_id': str(bot.user.id), 'reason': 'Auto: Discord invite link'})
+        embed = mod_embed('Auto Chatban (Invite Link)', bot.user, message.author, 'Posted a Discord server invite link')
+        embed.color = COLORS['error']
+        await send_log(message.guild, embed)
+        alert = await message.channel.send(embed=error_embed('Invite Link Detected', f'{message.author.mention} has been chatbanned for posting a Discord invite link.'))
+        try: await message.author.send(embed=error_embed('Chatbanned', f'You have been chatbanned in **{message.guild.name}** for posting a Discord server invite link.'))
+        except: pass
+        await asyncio.sleep(6)
+        try: await alert.delete()
+        except: pass
+        return
+
+    # ── Mass mentions (5+ users in one message → 10 min mute) ───
+    mention_count = len(set(message.mentions))
+    if mention_count >= 5 and not acted:
+        try: await message.delete()
+        except: pass
+        acted = await _auto_mute(member, message.guild, message.channel, f'mass mention ({mention_count} users)', 10)
+        if acted: return
+
+    # ── Message spam (6+ messages in 10s → 5 min mute) ──────────
+    spam_map.setdefault(key, [])
+    spam_map[key] = [t for t in spam_map[key] if now - t < 10]
+    spam_map[key].append(now)
+    if len(spam_map[key]) >= 6 and not acted:
+        spam_map[key] = []
+        acted = await _auto_mute(member, message.guild, message.channel, 'message spam (6+ messages in 10s)', 5)
+        if acted: return
+
+    # ── Repeated messages (same text 3+ times → 5 min mute) ─────
+    clean = message.content.strip().lower()
+    if clean:
+        prev = repeat_map.get(key, {'text': '', 'count': 0, 'last': 0})
+        if clean == prev['text'] and now - prev['last'] < 30:
+            prev['count'] += 1
+            prev['last'] = now
+        else:
+            prev = {'text': clean, 'count': 1, 'last': now}
+        repeat_map[key] = prev
+        if prev['count'] >= 3 and not acted:
+            repeat_map[key] = {'text': '', 'count': 0, 'last': 0}
+            try: await message.delete()
+            except: pass
+            acted = await _auto_mute(member, message.guild, message.channel, 'repeated messages (same message 3+ times)', 5)
+            if acted: return
+
+    # ── Link spam (4+ links in 30s → 10 min mute) ───────────────
+    URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
+    if URL_RE.search(message.content):
+        link_map.setdefault(key, [])
+        link_map[key] = [t for t in link_map[key] if now - t < 30]
+        link_map[key].append(now)
+        if len(link_map[key]) >= 4 and not acted:
+            link_map[key] = []
+            try: await message.delete()
+            except: pass
+            acted = await _auto_mute(member, message.guild, message.channel, 'link spam (4+ links in 30s)', 10)
+            if acted: return
+
+    # ── Sticky message handler ───────────────────────────────────
+    sticky = get_sticky(gid, message.channel.id)
+    if sticky:
         old_msg_id = sticky.get('message_id')
         if old_msg_id:
             try:
@@ -1149,7 +1226,7 @@ async def on_message(message):
                 await old_msg.delete()
             except: pass
         new_sticky = await message.channel.send(embed=discord.Embed(description=f'📌 {sticky["text"]}', color=0xFEE75C))
-        set_sticky(message.guild.id, message.channel.id, sticky['text'], new_sticky.id)
+        set_sticky(gid, message.channel.id, sticky['text'], new_sticky.id)
 
     await bot.process_commands(message)
 
