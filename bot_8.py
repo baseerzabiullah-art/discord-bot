@@ -1169,24 +1169,16 @@ async def on_message(message):
         except: pass
         return
 
-    # ── Mass mentions (5+ users in one message → 10 min mute) ───
-    mention_count = len(set(message.mentions))
-    if mention_count >= 5 and not acted:
+    # ── Mass mentions (5+ unique user pings → 10 min mute) ──────
+    raw_mention_count = len(set(message.raw_mentions))
+    if raw_mention_count >= 5 and not acted:
         try: await message.delete()
         except: pass
-        acted = await _auto_mute(member, message.guild, message.channel, f'mass mention ({mention_count} users)', 10)
+        acted = await _auto_mute(member, message.guild, message.channel, f'mass mention ({raw_mention_count} users)', 10)
         if acted: return
 
-    # ── Message spam (6+ messages in 10s → 5 min mute) ──────────
-    spam_map.setdefault(key, [])
-    spam_map[key] = [t for t in spam_map[key] if now - t < 10]
-    spam_map[key].append(now)
-    if len(spam_map[key]) >= 6 and not acted:
-        spam_map[key] = []
-        acted = await _auto_mute(member, message.guild, message.channel, 'message spam (6+ messages in 10s)', 5)
-        if acted: return
-
-    # ── Repeated messages (same text 3+ times → 5 min mute) ─────
+    # ── Repeated messages (same text 3+ times in 30s → 5 min mute)
+    # Checked BEFORE general spam so it can fire independently
     clean = message.content.strip().lower()
     if clean:
         prev = repeat_map.get(key, {'text': '', 'count': 0, 'last': 0})
@@ -1198,10 +1190,20 @@ async def on_message(message):
         repeat_map[key] = prev
         if prev['count'] >= 3 and not acted:
             repeat_map[key] = {'text': '', 'count': 0, 'last': 0}
+            spam_map[key] = []
             try: await message.delete()
             except: pass
             acted = await _auto_mute(member, message.guild, message.channel, 'repeated messages (same message 3+ times)', 5)
             if acted: return
+
+    # ── Message spam (6+ messages in 10s → 5 min mute) ──────────
+    spam_map.setdefault(key, [])
+    spam_map[key] = [t for t in spam_map[key] if now - t < 10]
+    spam_map[key].append(now)
+    if len(spam_map[key]) >= 6 and not acted:
+        spam_map[key] = []
+        acted = await _auto_mute(member, message.guild, message.channel, 'message spam (6+ messages in 10s)', 5)
+        if acted: return
 
     # ── Link spam (4+ links in 30s → 10 min mute) ───────────────
     URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
