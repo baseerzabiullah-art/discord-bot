@@ -203,6 +203,36 @@ def remove_reminder(rid):
         del data[rid]
         _save('reminders.json', data)
 
+# --- STATS CHANNELS ---
+def get_stats_channels(guild_id):
+    return get_config(guild_id).get('statsChannels', {})
+
+def set_stats_channel(guild_id, kind, channel_id):
+    cfg = _load('config.json')
+    gid = str(guild_id)
+    cfg.setdefault(gid, {}).setdefault('statsChannels', {})[kind] = str(channel_id)
+    _save('config.json', cfg)
+
+# --- GIVEAWAYS ---
+def save_giveaway(guild_id, msg_id, data):
+    d = _load('giveaways.json')
+    d.setdefault(str(guild_id), {})[str(msg_id)] = data
+    _save('giveaways.json', d)
+
+def get_giveaway(guild_id, msg_id):
+    return _load('giveaways.json').get(str(guild_id), {}).get(str(msg_id))
+
+def delete_giveaway(guild_id, msg_id):
+    d = _load('giveaways.json')
+    gid = str(guild_id)
+    if gid in d and str(msg_id) in d[gid]:
+        del d[gid][str(msg_id)]
+        _save('giveaways.json', d)
+
+def get_all_giveaways():
+    return _load('giveaways.json')
+
+
 # --- WARN DM TOGGLE ---
 def get_warn_dm(guild_id):
     return get_config(guild_id).get('warnDm', True)  # default ON
@@ -417,7 +447,9 @@ intents.invites     = True
 
 bot = commands.Bot(command_prefix=PREFIXES, intents=intents, help_command=None)
 tree = bot.tree
-spam_map = {}
+spam_map    = {}   # (guild_id, user_id) -> [timestamps]
+repeat_map  = {}   # (guild_id, user_id) -> {text, count, last}
+link_map    = {}   # (guild_id, user_id) -> [timestamps]
 snipe_map = {}   # channel_id -> {author, content, attachments, timestamp}
 invite_cache = {}  # guild_id -> {code: uses}
 giveaway_store = {}  # msg_id -> {prize, host_id, channel_id, role_id}
